@@ -157,7 +157,7 @@ class AlignFrames(object):
         :return: True, if successful. Otherwise return False.
         """
 
-        if index < 0 or index > len(self.alignment_rect_bounds):
+        if index < 0 or index >= len(self.alignment_rect_bounds):
             return False
         else:
             self.y_low_opt, self.y_high_opt, self.x_low_opt, self.x_high_opt = \
@@ -342,7 +342,7 @@ class AlignFrames(object):
 
                     else:
                         raise NotSupportedError(
-                            "Frame alignment method " + configuration.align_frames_method +
+                            "Frame alignment method " + self.configuration.align_frames_method +
                             " not supported")
 
                     # If the local search was unsuccessful, quit the frame loop with an error.
@@ -365,8 +365,8 @@ class AlignFrames(object):
                             dx_min_cum) - 2 * self.configuration.align_frames_search_width - \
                             self.configuration.align_frames_border_width < \
                             self.reference_window_shape[1]:
-                        raise ArgumentError("Frame stabilization window does not fit into"
-                                            " intersection")
+                        raise ArgumentError("frame " + str(idx) + " (stabilization window does"
+                                            " not fit into intersection)")
 
                     new_reference_window = False
                     # Start with the lower y edge.
@@ -452,6 +452,10 @@ class AlignFrames(object):
         # Calculate moments of binary image
         M = moments(thresh)
 
+        # A frame without any brightness variation has no center of gravity.
+        if M["m00"] == 0:
+            raise InternalError("Center of gravity cannot be computed for a featureless frame")
+
         # Calculate coordinates for center of gravity and round pixel
         # coordinates to the nearest integers.
         cog_x = round(M["m10"] / M["m00"])
@@ -459,7 +463,7 @@ class AlignFrames(object):
 
         # If the computed center of gravity is outside the frame bounds, raise an error (should be
         # impossible).
-        if not 0 < cog_y < frame.shape[0] or not 0 < cog_x < frame.shape[1]:
+        if not 0 <= cog_y < frame.shape[0] or not 0 <= cog_x < frame.shape[1]:
             raise InternalError(
                 "Center of gravity coordinates [" + str(cog_y) + ", " + str(
                     cog_x) + "] of reference frame are out of bounds")
@@ -638,14 +642,15 @@ class AlignFrames(object):
                                               self.intersection_shape[1][1] -
                                               self.frame_shifts[idx][1]])
                 frame_indices.append(str(idx))
-            Miscellaneous.write_video(name, frames_mono_stabilized, frame_indices, 5)
+            # The conversion to 8bit (if necessary) is derived from the frame dtype.
+            Miscellaneous.write_video(name, frames_mono_stabilized, frame_indices, fps)
         else:
             # Write the original frames (not stabilized) with index number insertions.
             frames_mono = []
             for idx in range(self.frames.number):
                 frame_indices.append(str(idx))
                 frames_mono.append(self.frames.frames_mono(idx))
-            Miscellaneous.write_video(name, frames_mono, frame_indices, 5)
+            Miscellaneous.write_video(name, frames_mono, frame_indices, fps)
 
 
 if __name__ == "__main__":

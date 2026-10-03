@@ -34,7 +34,19 @@ class ConfigurationEditor(QtWidgets.QFrame, Ui_ConfigurationDialog):
     object. The interaction with the user is through the ConfigurationDialog class.
     """
 
-    def __init__(self, parent_gui, parent=None):
+    def __init__(self, parent_gui, parent=None, configuration_source=None):
+        """
+        Initialize the configuration editor.
+
+        :param parent_gui: Main GUI object. Its configuration is updated when "OK" is pressed.
+        :param parent: Parent widget
+        :param configuration_source: Optional Configuration object (e.g. read from a ".pss" file)
+                                     with which the editor widgets are initialized. If None, the
+                                     current configuration of the parent GUI is used. In both
+                                     cases, changes are only applied on "OK", and they are compared
+                                     with the current configuration of the parent GUI.
+        """
+
         QtWidgets.QFrame.__init__(self, parent)
         self.setupUi(self)
 
@@ -53,8 +65,12 @@ class ConfigurationEditor(QtWidgets.QFrame, Ui_ConfigurationDialog):
         self.configuration.configuration_changed = False
 
         # Create a ConfigurationParameters object and set it to the current parameters.
+        self.configuration_source = configuration_source
         self.config_copy = ConfigurationParameters()
-        self.config_copy.copy_from_config_object(self.configuration)
+        if configuration_source is not None:
+            self.config_copy.copy_from_config_object(configuration_source)
+        else:
+            self.config_copy.copy_from_config_object(self.configuration)
 
         self.buttonBox.accepted.connect(self.accept)
         self.buttonBox.rejected.connect(self.reject)
@@ -320,6 +336,7 @@ class ConfigurationEditor(QtWidgets.QFrame, Ui_ConfigurationDialog):
         if state:
             self.config_copy.global_parameters_maximum_memory_active = True
             # With a fixed memory limit buffering is set to 'auto'
+            self.config_copy.global_parameters_buffering_level = -1
             self.gpbl_combobox.setCurrentText('auto')
             self.gpbl_combobox.setEnabled(False)
             self.mr_lineEdit.setEnabled(True)
@@ -648,6 +665,14 @@ class ConfigurationEditor(QtWidgets.QFrame, Ui_ConfigurationDialog):
             self.configuration.stack_frames_drizzle_factor_string = self.config_copy.stack_frames_drizzle_factor_string
             self.configuration.configuration_changed = True
             go_back_to_activities.append('Stack frames')
+
+        # If the parameters were loaded from a configuration file, adopt the postprocessing
+        # parameters stored in that file as well.
+        if self.configuration_source is not None and \
+                self.configuration_source.config_parser_object is not None:
+            self.configuration.postproc_data_object.load_config(
+                self.configuration_source.config_parser_object)
+            self.configuration.configuration_changed = True
 
         # Set dependent parameters.
         self.configuration.set_derived_parameters()

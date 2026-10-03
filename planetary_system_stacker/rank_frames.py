@@ -28,7 +28,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from cv2 import meanStdDev
-from numpy import array, full
+from numpy import array, full, empty, arange, partition, sort, cumsum, abs as np_abs, float64, \
+    finfo, intp
+from numpy.lib.stride_tricks import sliding_window_view
 
 from configuration import Configuration
 from exceptions import ArgumentError, NotSupportedError, Error
@@ -102,7 +104,7 @@ class RankFrames(object):
         if method != Miscellaneous.local_contrast_laplace:
             for frame_index in range(self.number_original):
                 frame = self.frames.frames_mono_blurred(frame_index)
-                if self.progress_signal is not None and frame_index % self.signal_step_size == 1:
+                if self.progress_signal is not None and frame_index % self.signal_step_size == 0:
                     self.progress_signal.emit("Rank all frames",
                                               int(round(10*frame_index / self.number_original) * 10))
                 if self.configuration.frames_normalization:
@@ -116,7 +118,7 @@ class RankFrames(object):
             for frame_index in range(self.number_original):
                 frame = self.frames.frames_mono_blurred_laplacian(frame_index)
                 # self.frame_ranks.append(mean((frame - frame.mean())**2))
-                if self.progress_signal is not None and frame_index % self.signal_step_size == 1:
+                if self.progress_signal is not None and frame_index % self.signal_step_size == 0:
                     self.progress_signal.emit("Rank all frames",
                                               int(round(10*frame_index / self.number_original) * 10))
                 if self.configuration.frames_normalization:
@@ -125,14 +127,17 @@ class RankFrames(object):
                 else:
                     self.frame_ranks_original.append(meanStdDev(frame)[1][0][0])
 
+        # Store the quality values as a numpy array (float64), so that they can be normalized
+        # with a single division below.
+        self.frame_ranks_original = array(self.frame_ranks_original, dtype=float64)
+
         # Sort the frame indices in descending order of quality.
         self.quality_sorted_indices_original = sorted(range(self.number_original),
                                              key=self.frame_ranks_original.__getitem__, reverse=True)
 
         # Compute the inverse index list: For each frame the rank_index is the corresponding index
         # in the sorted frame_ranks list.
-        self.rank_indices_original = [self.quality_sorted_indices_original.index(index) for index in
-                             range(self.number_original)]
+        self.rank_indices_original = self.inverse_permutation(self.quality_sorted_indices_original)
 
         if self.progress_signal is not None:
             self.progress_signal.emit("Rank all frames", 100)
@@ -140,7 +145,8 @@ class RankFrames(object):
         # Set the index of the best frame, and normalize all quality values.
         self.frame_ranks_max_index_original = self.quality_sorted_indices_original[0]
         self.frame_ranks_max_value_original = self.frame_ranks_original[self.frame_ranks_max_index_original]
-        self.frame_ranks_original /= self.frame_ranks_max_value_original
+        if self.frame_ranks_max_value_original > 0.:
+            self.frame_ranks_original /= self.frame_ranks_max_value_original
 
         # Keep the original ranking data and prepare for index translation. The translation can be
         # reset later, and the original ranking be re-established.
@@ -164,7 +170,8 @@ class RankFrames(object):
         # Set the number of ranks to the number of included frames.
         self.number = len(index_translation)
 
-        self.frame_ranks = [self.frame_ranks_original[index] for index in index_translation]
+        self.frame_ranks = array([self.frame_ranks_original[index] for index in index_translation],
+                                 dtype=float64)
 
         # Sort the frame indices in descending order of quality.
         self.quality_sorted_indices = sorted(range(self.number),
@@ -172,8 +179,7 @@ class RankFrames(object):
 
         # Compute the inverse index list: For each frame the rank_index is the corresponding index
         # in the sorted frame_ranks list.
-        self.rank_indices = [self.quality_sorted_indices.index(index) for index in
-                             range(self.number)]
+        self.rank_indices = self.inverse_permutation(self.quality_sorted_indices)
 
         if self.progress_signal is not None:
             self.progress_signal.emit("Rank all frames", 100)
@@ -181,7 +187,23 @@ class RankFrames(object):
         # Set the index of the best frame, and normalize all quality values.
         self.frame_ranks_max_index = self.quality_sorted_indices[0]
         self.frame_ranks_max_value = self.frame_ranks[self.frame_ranks_max_index]
-        self.frame_ranks /= self.frame_ranks_max_value
+        if self.frame_ranks_max_value > 0.:
+            self.frame_ranks /= self.frame_ranks_max_value
+
+    @staticmethod
+    def inverse_permutation(sorted_indices):
+        """
+        Invert a permutation given as a list of indices: For each index i the result contains the
+        position of i in "sorted_indices". This replaces "sorted_indices.index(i)" for all i, which
+        has quadratic complexity.
+
+        :param sorted_indices: List with a permutation of range(len(sorted_indices))
+        :return: List (of Python int) with the inverse permutation
+        """
+
+        inverse = empty((len(sorted_indices),), dtype=intp)
+        inverse[sorted_indices] = arange(len(sorted_indices))
+        return inverse.tolist()
 
     def reset_index_translation(self):
         """
@@ -219,27 +241,57 @@ class RankFrames(object):
             raise ArgumentError("Size of best frames region " + str(region_size) + " larger "
                                 "than the total number of frames " + str(self.number))
 
-        best_indices = []
-        rank_sum_opt = 0.
+        frame_ranks = array(self.frame_ranks, dtype=float64)
+        number_windows = self.number - region_size + 1
 
         # Construct a sliding window on the full index range. For each window position find the
         # best "number_frames" frames. Find the window and the best frame set within with the
         # highest overall score.
-        for start_index in range(self.number - region_size + 1):
-            end_index = start_index + region_size
-            best_indices_in_range = sorted(range(start_index, end_index),
-                                           key=self.frame_ranks.__getitem__, reverse=True)[
-                                    :number_frames]
-            rank_sum = sum([self.frame_ranks[i] for i in best_indices_in_range])
+        #
+        # The sum of the "number_frames" largest values in each window does not depend on how ties
+        # are broken. It is first computed approximately for all windows (partial sort with
+        # np.partition instead of a full sort per window). Only windows which could be optimal
+        # (up to the summation rounding error) are then evaluated with the exact summation order
+        # of the original algorithm (descending values, sequential addition), so that the
+        # selection is identical to sorting every window.
+        windows = sliding_window_view(frame_ranks, region_size)
+        kth = region_size - number_frames
+        chunk = max(1, (1 << 22) // region_size)
+        rank_sums_approx = empty((number_windows,), dtype=float64)
+        for chunk_start in range(0, number_windows, chunk):
+            chunk_end = min(chunk_start + chunk, number_windows)
+            rank_sums_approx[chunk_start:chunk_end] = partition(
+                windows[chunk_start:chunk_end], kth, axis=1)[:, kth:].sum(axis=1)
+
+        # Bound for the difference between approximate and exact sums.
+        tolerance = 4. * (number_frames + 1) * finfo(float64).eps * \
+                    max(float(np_abs(rank_sums_approx).max()), 1.e-300)
+        candidates = (rank_sums_approx >= rank_sums_approx.max() - tolerance).nonzero()[0]
+
+        start_index_opt = None
+        rank_sum_opt = 0.
+        for start_index in candidates.tolist():
+            top_values = partition(windows[start_index], kth)[kth:]
+            # Sequential summation in descending order, as in "sum(sorted(...))".
+            rank_sum = cumsum(sort(top_values)[::-1])[-1]
             if rank_sum > rank_sum_opt:
                 rank_sum_opt = rank_sum
-                best_indices = best_indices_in_range
+                start_index_opt = start_index
+
+        # If no window has a positive rank sum (e.g. all ranks are zero), take the first window.
+        if start_index_opt is None:
+            start_index_opt = 0
+        best_indices = sorted(range(start_index_opt, start_index_opt + region_size),
+                              key=frame_ranks.__getitem__, reverse=True)[:number_frames]
 
         # Compare the average frame quality with the optimal choice if no time restrictions were
         # present.
         rank_sum_global = sum(
             [self.frame_ranks[i] for i in self.quality_sorted_indices[:number_frames]])
-        quality_loss_percent = round(100. * (rank_sum_global - rank_sum_opt) / rank_sum_global, 1)
+        if rank_sum_global > 0.:
+            quality_loss_percent = round(100. * (rank_sum_global - rank_sum_opt) / rank_sum_global, 1)
+        else:
+            quality_loss_percent = 0.
 
         # For the frames included in mean frame computation compute the average position on the
         # video time line.

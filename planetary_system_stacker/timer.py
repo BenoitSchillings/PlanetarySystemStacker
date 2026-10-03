@@ -39,6 +39,8 @@ class timer(object):
         """
 
         self.counters = OrderedDict()
+        # Names of timers which are currently running (i.e. started, but not stopped yet).
+        self.running = set()
 
     def create(self, name):
         """
@@ -52,6 +54,7 @@ class timer(object):
             raise ArgumentError("Attempt to initialize timer with existing name")
         else:
             self.counters[name] = [0., time()]
+            self.running.add(name)
 
     def create_no_check(self, name):
         """
@@ -62,6 +65,7 @@ class timer(object):
         """
 
         self.counters[name] = [0., time()]
+        self.running.add(name)
 
     def delete(self, name):
         """
@@ -75,6 +79,7 @@ class timer(object):
             raise ArgumentError("Attempt to delete timer with undefined name")
         else:
             del self.counters[name]
+            self.running.discard(name)
 
     def exists(self, name):
         """
@@ -85,6 +90,16 @@ class timer(object):
         """
 
         return name in self.counters.keys()
+
+    def is_running(self, name):
+        """
+        Find out if a named timer is currently running (started, but not stopped yet).
+
+        :param name: Name of the timer
+        :return: True, if the timer exists and is running; otherwise False.
+        """
+
+        return name in self.running
 
     def start(self, name):
         """
@@ -98,10 +113,12 @@ class timer(object):
             raise ArgumentError("Attempt to start timer with undefined name")
         else:
             self.counters[name][1] = time()
+            self.running.add(name)
 
     def stop(self, name):
         """
-        Stop a timer.
+        Stop a timer. Stopping a timer which is not running does not change its accumulated
+        time (otherwise the same interval would be counted twice).
 
         :param name: Name of the timer
         :return: Elapsed time accumulated during start/stop intervals of this timer so far.
@@ -110,7 +127,9 @@ class timer(object):
         if name not in self.counters.keys():
             raise ArgumentError("Attempt to stop timer with undefined name")
         else:
-            self.counters[name][0] += time() - self.counters[name][1]
+            if name in self.running:
+                self.counters[name][0] += time() - self.counters[name][1]
+                self.running.discard(name)
             return self.counters[name][0]
 
     def read(self, name):

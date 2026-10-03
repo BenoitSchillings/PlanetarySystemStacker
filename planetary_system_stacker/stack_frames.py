@@ -31,7 +31,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from cv2 import FONT_HERSHEY_SIMPLEX, putText, resize, INTER_CUBIC, INTER_LINEAR
 from numpy import zeros, full, empty, float32, newaxis, arange, count_nonzero, \
-    sqrt, uint16, clip, minimum, mean
+    sqrt, uint8, uint16, clip, minimum, mean
 from skimage import img_as_uint, img_as_ubyte
 
 from align_frames import AlignFrames
@@ -111,20 +111,19 @@ class StackFrames(object):
                                              self.frames.color)
 
         # The summation buffer needs to accommodate three color channels in the case of color
-        # images. The size is extended if drizzling is active. In this case also allocate a buffer
-        # where the interpolated frames are stored.
+        # images. The size is extended if drizzling is active.
         if self.frames.color:
             self.stacked_image_buffer = zeros([self.dim_y_drizzled, self.dim_x_drizzled, 3],
                                               dtype=float32)
-            if self.drizzle:
-                self.frame_drizzled = zeros([self.dim_y_drizzled, self.dim_x_drizzled, 3],
-                                                  dtype=float32)
         else:
             self.stacked_image_buffer = zeros([self.dim_y_drizzled, self.dim_x_drizzled],
                                               dtype=float32)
-            if self.drizzle:
-                self.frame_drizzled = zeros([self.dim_y_drizzled, self.dim_x_drizzled],
-                                                  dtype=float32)
+
+        # If drizzling is active, buffers for the float32 frame and the interpolated frame are
+        # allocated on first use (their size is that of the full frames, not of the intersection)
+        # and re-used for all frames.
+        self.frame_float32 = None
+        self.frame_drizzled = None
 
         # If the alignment point patches do not cover the entire frame, a background image must
         # be computed and blended in. At this point it is not yet clear if this is necessary.
@@ -246,20 +245,17 @@ class StackFrames(object):
             # Subdivide the image area in quadratic patches. Cycle through all patch locations.
             for patch_y_low in range(0, self.dim_y,
                                      self.configuration.stack_frames_background_patch_size):
+                # The upper bound is exclusive. Since patch_y_low < self.dim_y, the patch cannot
+                # have zero size.
                 patch_y_high = min(
                     patch_y_low + self.configuration.stack_frames_background_patch_size,
-                    self.dim_y - 1)
+                    self.dim_y)
 
-                # Handle the special case where the patch has zero size in one direction.
-                if patch_y_low == patch_y_high:
-                    continue
                 for patch_x_low in range(0, self.dim_x,
                                          self.configuration.stack_frames_background_patch_size):
                     patch_x_high = min(
                         patch_x_low + self.configuration.stack_frames_background_patch_size,
-                        self.dim_x - 1)
-                    if patch_x_low == patch_x_high:
-                        continue
+                        self.dim_x)
 
                     # If the patch contains pixels where the background is used, add it to the list.
                     if count_nonzero(self.sum_single_frame_weights[
@@ -334,38 +330,74 @@ class StackFrames(object):
         # Initialize widths of border areas where artifacts occur because not all patches contribute.
         self.border_y_low = self.border_y_high = self.border_x_low = self.border_x_high = 0
 
+        # Compute once the set of frames which contribute to the background image (if needed).
+        if self.number_stacking_holes > 0:
+            background_frame_indices = set(
+                self.rank_frames.quality_sorted_indices[:self.alignment_points.stack_size])
+        else:
+            background_frame_indices = set()
+
         # Go through the list of all frames.
         for frame_index in range(self.frames.number):
 
-            # If brightness normalization is switched on, change the brightness of this frame to
-            # the median of all frames.
-            if self.configuration.frames_normalization:
-                frame = self.frames.frames(frame_index) * median_brightness / \
-                        (self.frames.average_brightness(frame_index) + 1.e-7)
-            else:
-                frame = self.frames.frames(frame_index)
-
-            # Change the current frame into float32. If drizzle is active, also interpolate values.
-            if self.drizzle:
-                self.frame_drizzled = resize(frame.astype(float32),
-                                             (frame.shape[1]*self.configuration.drizzle_factor, frame.shape[0]*self.configuration.drizzle_factor),
-                                             interpolation=INTER_LINEAR)
-            else:
-                self.frame_drizzled = frame.astype(float32)
-
-            frame_mono_blurred = self.frames.frames_mono_blurred(frame_index)
-
             # After every "signal_step_size"th frame, send a progress signal to the main GUI.
-            if self.progress_signal is not None and frame_index % self.signal_step_size == 1:
+            if self.progress_signal is not None and frame_index % self.signal_step_size == 0:
                 self.progress_signal.emit("Stack frames",
                                           int(round(10 * frame_index / self.frames.number) * 10))
+
+            # Skip frames which neither contribute to any alignment point nor to the background.
+            used_alignment_points = self.frames.used_alignment_points[frame_index]
+            contributes_to_background = frame_index in background_frame_indices
+            if not used_alignment_points and not contributes_to_background:
+                continue
+
+            frame = self.frames.frames(frame_index)
+
+            # If brightness normalization is switched on, the brightness of this frame is changed
+            # to the median of all frames. To avoid full-frame copies, the factor is applied only
+            # to the pixels actually used (alignment point patches and background patches).
+            if self.configuration.frames_normalization:
+                brightness_normalization = (median_brightness,
+                                            self.frames.average_brightness(frame_index) + 1.e-7)
+            else:
+                brightness_normalization = None
+
+            if used_alignment_points:
+                # If drizzle is active, change the current frame into float32 and interpolate
+                # values. Buffers are re-used for all frames.
+                if self.drizzle:
+                    if brightness_normalization is not None:
+                        frame_normalized = frame * brightness_normalization[0] / \
+                                           brightness_normalization[1]
+                    else:
+                        frame_normalized = frame
+                    if self.frame_float32 is None or self.frame_float32.shape != frame.shape:
+                        self.frame_float32 = empty(frame.shape, dtype=float32)
+                        self.frame_drizzled = empty(
+                            (frame.shape[0] * self.configuration.drizzle_factor,
+                             frame.shape[1] * self.configuration.drizzle_factor) + frame.shape[2:],
+                            dtype=float32)
+                    self.frame_float32[...] = frame_normalized
+                    resize(self.frame_float32,
+                           (frame.shape[1] * self.configuration.drizzle_factor,
+                            frame.shape[0] * self.configuration.drizzle_factor),
+                           dst=self.frame_drizzled, interpolation=INTER_LINEAR)
+                    frame_stacked = self.frame_drizzled
+                    # The brightness normalization has been applied already.
+                    patch_normalization = None
+                else:
+                    # Without drizzling, patches are cut directly from the original frame.
+                    frame_stacked = frame
+                    patch_normalization = brightness_normalization
+
+                frame_mono_blurred = self.frames.frames_mono_blurred(frame_index)
 
             # Look up the constant shifts of the given frame with respect to the mean frame.
             dy = self.align_frames.dy[frame_index]
             dx = self.align_frames.dx[frame_index]
 
             # Go through all alignment points for which this frame was found to be among the best.
-            for alignment_point_index in self.frames.used_alignment_points[frame_index]:
+            for alignment_point_index in used_alignment_points:
                 alignment_point = self.alignment_points.alignment_points[alignment_point_index]
 
                 # Compute the local warp shift for this frame.
@@ -387,8 +419,12 @@ class StackFrames(object):
 
                 # Increment the counter corresponding to the 2D warp shift. Increase the resolution
                 # according to the drizzle factor.
+                # Shifts beyond the table size (possible with some AP methods) are counted in the
+                # last entry.
                 if success:
-                    self.shift_distribution[int(round(sqrt(shift_y_drizzled ** 2 + shift_x_drizzled ** 2)))] += 1
+                    self.shift_distribution[min(
+                        int(round(sqrt(shift_y_drizzled ** 2 + shift_x_drizzled ** 2))),
+                        len(self.shift_distribution) - 1)] += 1
                 else:
                     self.shift_failure_counter += 1
 
@@ -446,19 +482,18 @@ class StackFrames(object):
 
                 # Add the shifted alignment point patch to the AP's stacking buffer.
                 self.my_timer.start('Stacking: remapping and adding')
-                self.remap_rigid(self.frame_drizzled, alignment_point['stacking_buffer'],
+                self.remap_rigid(frame_stacked, alignment_point['stacking_buffer'],
                                  total_shift_y_drizzled, total_shift_x_drizzled,
                                  alignment_point['patch_y_low_drizzled'],
                                  alignment_point['patch_y_high_drizzled'],
                                  alignment_point['patch_x_low_drizzled'],
-                                 alignment_point['patch_x_high_drizzled'])
+                                 alignment_point['patch_x_high_drizzled'],
+                                 brightness_normalization=patch_normalization)
                 self.my_timer.stop('Stacking: remapping and adding')
 
             # If there are holes between AP patches, add this frame's contribution (if any) to the
             # averaged background image.
-            if self.number_stacking_holes > 0 and \
-                    frame_index in self.rank_frames.quality_sorted_indices[
-                        :self.alignment_points.stack_size]:
+            if contributes_to_background:
                 self.my_timer.start('Stacking: computing background')
 
                 # Treat the case that the background is computed for specific patches only.
@@ -466,12 +501,15 @@ class StackFrames(object):
                     for patch in self.background_patches:
                         self.averaged_background[patch['patch_y_low']:patch['patch_y_high'],
                                   patch['patch_x_low']:patch['patch_x_high']] += \
-                            frame[patch['patch_y_low'] + dy : patch['patch_y_high'] + dy,
-                                  patch['patch_x_low'] + dx : patch['patch_x_high'] + dx]
+                            self.normalize_brightness(
+                                frame[patch['patch_y_low'] + dy : patch['patch_y_high'] + dy,
+                                      patch['patch_x_low'] + dx : patch['patch_x_high'] + dx],
+                                brightness_normalization)
 
                 # The complete background image is computed.
                 else:
-                    self.averaged_background += frame[dy:self.dim_y + dy, dx:self.dim_x + dx]
+                    self.averaged_background += self.normalize_brightness(
+                        frame[dy:self.dim_y + dy, dx:self.dim_x + dx], brightness_normalization)
                 self.my_timer.stop('Stacking: computing background')
 
         if self.progress_signal is not None:
@@ -505,7 +543,25 @@ class StackFrames(object):
             self.averaged_background /= self.alignment_points.stack_size
             self.my_timer.stop('Stacking: computing background')
 
-    def remap_rigid(self, frame, buffer, shift_y, shift_x, y_low, y_high, x_low, x_high):
+    @staticmethod
+    def normalize_brightness(patch, brightness_normalization):
+        """
+        Apply the brightness normalization factor to an image patch. The arithmetic is the same
+        as if the full frame had been normalized before cutting out the patch.
+
+        :param patch: Image patch (view into a frame)
+        :param brightness_normalization: Either None (no normalization), or a tuple
+                                         (median_brightness, frame_brightness) with which the
+                                         patch is multiplied and divided, respectively.
+        :return: Normalized patch (or the unchanged patch if no normalization is to be applied)
+        """
+
+        if brightness_normalization is None:
+            return patch
+        return patch * brightness_normalization[0] / brightness_normalization[1]
+
+    def remap_rigid(self, frame, buffer, shift_y, shift_x, y_low, y_high, x_low, x_high,
+                    brightness_normalization=None):
         """
         The alignment point patch is taken from the given frame with a constant shift in x and y
         directions. The shifted patch is then added to the given alignment point buffer.
@@ -518,6 +574,9 @@ class StackFrames(object):
         :param y_high: Upper y index of the quality window on which this method operates
         :param x_low: Lower x index of the quality window on which this method operates
         :param x_high: Upper x index of the quality window on which this method operates
+        :param brightness_normalization: Either None, or a tuple (median_brightness,
+                                         frame_brightness) used to normalize the patch brightness
+                                         (see method "normalize_brightness").
         :return: -
         """
 
@@ -555,8 +614,13 @@ class StackFrames(object):
         # If frames are in color, stack all three color channels using the same mapping. Please note
         # that in this case the buffers have a third dimension (color), while monochrome buffers
         # are two-dimensional. Add the frame contribution to the stacking buffer.
-        buffer[y_low_target:y_high_target, x_low_target:x_high_target] += \
-            frame[y_low_source:y_high_source, x_low_source:x_high_source]
+        # The patch is converted to float32 before adding it, as if the full frame had been
+        # converted. (Integer types up to 16 bit are converted exactly by numpy in the addition.)
+        patch = self.normalize_brightness(
+            frame[y_low_source:y_high_source, x_low_source:x_high_source], brightness_normalization)
+        if patch.dtype not in (float32, uint8, uint16):
+            patch = patch.astype(float32)
+        buffer[y_low_target:y_high_target, x_low_target:x_high_target] += patch
 
     def merge_alignment_point_buffers(self):
         """

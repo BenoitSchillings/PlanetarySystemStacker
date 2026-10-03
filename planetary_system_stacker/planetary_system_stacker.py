@@ -281,8 +281,8 @@ class PlanetarySystemStacker(QtWidgets.QMainWindow):
         self.job_number = 0
         self.job_index = 0
         self.jobs = []
-        self.activities = ['Previous job', 'Read frames', 'Rank frames', 'Align frames',
-                           'Select stack size', 'Set ROI', 'Set alignment points',
+        self.activities = ['Previous job', 'Read frames', 'Rank frames', 'Select frames',
+                           'Align frames', 'Select stack size', 'Set ROI', 'Set alignment points',
                            'Compute frame qualities', 'Stack frames', 'Save stacked image',
                            'Postprocessing', 'Save postprocessed image', 'Next job']
         self.activity = 'Read frames'
@@ -406,13 +406,7 @@ class PlanetarySystemStacker(QtWidgets.QMainWindow):
         # Only if parameters are changed later in the workflow, write a message to the protocol.
         if self.configuration.global_parameters_protocol_level > 1 and self.activity != 'Read frames':
             # If the attached logfile has been closed, re-open it.
-            if self.workflow.attached_log_file is not None:
-                if self.configuration.global_parameters_store_protocol_with_result and \
-                        self.workflow.attached_log_file.closed:
-                    try:
-                        self.workflow.attached_log_file = open(self.workflow.attached_log_name, 'a')
-                    except:
-                        pass
+            self.workflow.reopen_attached_log_file()
             Miscellaneous.protocol(
                 "+++ Parameter change: all phases after '" + earliest_phase + "' are invalidated +++",
                 self.workflow.attached_log_file, precede_with_timestamp=True)
@@ -461,17 +455,29 @@ class PlanetarySystemStacker(QtWidgets.QMainWindow):
         # If a valid file was selected, read parameters from the file and open the configuration
         # editor.
         if file_name != '':
-            # Read configuration parameters from the selected file.
-            self.configuration.read_config(file_name=file_name)
+            # Read configuration parameters from the selected file into a temporary configuration
+            # object. The live configuration is changed only if the configuration editor is left
+            # with "OK". This way, changes are detected (and the workflow is reset accordingly),
+            # and "Cancel" discards the parameters read.
+            config_from_file = Configuration()
+            try:
+                config_from_file.read_config(file_name=file_name)
+            except Exception as e:
+                if self.configuration.global_parameters_protocol_level > 0:
+                    Miscellaneous.protocol("Error: Cannot read configuration file " + file_name +
+                                           ": " + str(e), self.workflow.attached_log_file)
+                return
+            config_from_file.set_derived_parameters()
+
             # Remember the current directory for next file dialog.
-            self.configuration.current_dir = str(Path(file_name).parents[0])
-            self.display_widget(ConfigurationEditor(self))
+            self.configuration.hidden_parameters_current_dir = str(Path(file_name).parents[0])
+            self.display_widget(ConfigurationEditor(self, configuration_source=config_from_file))
 
             if self.configuration.global_parameters_protocol_level > 1 and \
-                    self.configuration.global_parameters_version_imported_from != \
+                    config_from_file.global_parameters_version_imported_from != \
                     self.configuration.global_parameters_version:
                 Miscellaneous.protocol("+++ Importing configuration from older version: " +
-                                self.configuration.global_parameters_version_imported_from + " +++",
+                                config_from_file.global_parameters_version_imported_from + " +++",
                                 self.workflow.attached_log_file)
 
     def save_config_file(self):
@@ -708,13 +714,8 @@ class PlanetarySystemStacker(QtWidgets.QMainWindow):
         # Get the choice of the combobox button.
         task = self.ui.comboBox_back.currentText()
         if self.configuration.global_parameters_protocol_level > 0:
-            if self.workflow.attached_log_file is not None:
-                if self.configuration.global_parameters_store_protocol_with_result and \
-                        self.workflow.attached_log_file.closed:
-                    try:
-                        self.workflow.attached_log_file = open(self.workflow.attached_log_name, 'a')
-                    except:
-                        pass
+            # If the attached logfile has been closed, re-open it.
+            self.workflow.reopen_attached_log_file()
             Miscellaneous.protocol("", self.workflow.attached_log_file,
                                    precede_with_timestamp=False)
             Miscellaneous.protocol("+++ Repeating from task: " + task + " +++",
@@ -723,6 +724,13 @@ class PlanetarySystemStacker(QtWidgets.QMainWindow):
         # If the end of the job queue was reached, reverse the last job index increment.
         if self.job_index == self.job_number and self.job_index > 0:
             self.job_index -= 1
+
+        # If the job had been finished already, the overall execution timer was stopped. Restart it
+        # so that only the time spent on the repeated tasks is added (and nothing is counted twice).
+        my_timer = self.workflow.my_timer
+        if my_timer is not None and my_timer.exists('Execution over all') and \
+                not my_timer.is_running('Execution over all'):
+            my_timer.start('Execution over all')
 
         # Restart from the specified task within the current job.
         if task in ['Read frames', 'Rank frames', 'Select frames', 'Align frames',
@@ -1414,8 +1422,7 @@ class PlanetarySystemStacker(QtWidgets.QMainWindow):
                 event.accept()
 
             # If there is an image log file still open, close it.
-            if self.workflow.attached_log_file:
-                self.workflow.attached_log_file.close()
+            self.workflow.close_attached_log_file()
 
             # Store the geometry of main window, so it is placed the same at next program start.
             if self.windowState() == QtCore.Qt.WindowMaximized:

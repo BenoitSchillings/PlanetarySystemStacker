@@ -23,7 +23,7 @@ along with PSS.  If not, see <http://www.gnu.org/licenses/>.
 import gc
 import platform
 import sys
-from os import listdir, rename, remove
+from os import listdir, rename, remove, sep, altsep
 from os.path import splitext, join, dirname
 
 import psutil
@@ -76,7 +76,7 @@ class Workflow(QtCore.QObject):
         self.activity = None
         self.attached_log_name = None
         self.attached_log_name_new = None
-        self.attached_log_file = None
+        self._attached_log_file = None
         self.stdout_saved = None
         self.output_redirected = False
         self.protocol_file = None
@@ -108,6 +108,77 @@ class Workflow(QtCore.QObject):
 
         # Create the calibration object, used for potential flat / dark corrections.
         self.calibration = Calibration(self.configuration)
+
+    @property
+    def attached_log_file(self):
+        """
+        Return the logfile attached to the current job, or None if there is no such file or if it
+        has been closed already. This way, Miscellaneous.protocol can never write to a closed file.
+
+        :return: Open file object or None
+        """
+
+        if self._attached_log_file is not None and self._attached_log_file.closed:
+            self._attached_log_file = None
+        return self._attached_log_file
+
+    @attached_log_file.setter
+    def attached_log_file(self, log_file):
+        self._attached_log_file = log_file
+
+    def close_attached_log_file(self):
+        """
+        Close the logfile attached to the current job (if open) and reset it to None.
+
+        :return: -
+        """
+
+        if self._attached_log_file is not None:
+            try:
+                self._attached_log_file.close()
+            except Exception:
+                pass
+        self._attached_log_file = None
+
+    def reopen_attached_log_file(self):
+        """
+        If logging with the result is requested and the logfile of the current (or last) job has
+        been closed already, re-open it in append mode.
+
+        :return: -
+        """
+
+        if self.configuration.global_parameters_store_protocol_with_result and \
+                self.attached_log_file is None and self.attached_log_name is not None:
+            try:
+                self._attached_log_file = open(self.attached_log_name, 'a')
+            except Exception:
+                self._attached_log_file = None
+
+    @staticmethod
+    def check_stabilization_patch_size(y_low, y_high, x_low, x_high, shape, min_fraction,
+                                       max_fraction):
+        """
+        Check if a stabilization patch selected manually is too large or too small relative to the
+        frame size.
+
+        :param y_low: Lower y coordinate of the patch
+        :param y_high: Upper y coordinate of the patch
+        :param x_low: Lower x coordinate of the patch
+        :param x_high: Upper x coordinate of the patch
+        :param shape: Frame shape (only the first two entries are used)
+        :param min_fraction: Minimum patch size as fraction of the frame size (each coordinate)
+        :param max_fraction: Maximum patch size as fraction of the frame size (each coordinate)
+        :return: "too large", "too small", or None if the patch size is acceptable.
+        """
+
+        y_fraction = (y_high - y_low) / shape[0]
+        x_fraction = (x_high - x_low) / shape[1]
+        if y_fraction > max_fraction or x_fraction > max_fraction:
+            return "too large"
+        if y_fraction < min_fraction or x_fraction < min_fraction:
+            return "too small"
+        return None
 
     @QtCore.pyqtSlot(list)
     def execute_create_master_dark(self, dark_names):
@@ -223,6 +294,11 @@ class Workflow(QtCore.QObject):
         # "names".
         else:  # input_type = 'image'
             self.activity = 'stacking'
+            # Remove trailing path separators. Otherwise output files (stacked image, log file)
+            # would be placed inside the input folder instead of next to it.
+            stripped_name = self.job.name.rstrip(sep + (altsep or ''))
+            if stripped_name:
+                self.job.name = stripped_name
             # Include only names with image extensions.
             names = [join(self.job.name, name) for name in listdir(self.job.name) if
                      splitext(name)[-1].lower() in image_extensions]
@@ -244,8 +320,7 @@ class Workflow(QtCore.QObject):
                     pass
 
         # Create logfile if requested to store the log with the stacked file.
-        if self.attached_log_file:
-            self.attached_log_file.close()
+        self.close_attached_log_file()
         if self.configuration.global_parameters_store_protocol_with_result:
             self.attached_log_file = open(self.attached_log_name, "w+")
         else:
@@ -493,24 +568,19 @@ class Workflow(QtCore.QObject):
             auto_execution = False
             if y_low_opt == 0 and y_high_opt == 0 and x_low_opt == 0 and x_high_opt == 0:
                 auto_execution = True
-            elif (y_high_opt - y_low_opt) / self.frames.shape[
-                0] > self.configuration.align_frames_max_stabilization_patch_fraction or (
-                    x_high_opt - x_low_opt) / self.frames.shape[
-                1] > self.configuration.align_frames_max_stabilization_patch_fraction and \
-                    self.configuration.global_parameters_protocol_level > 0:
-                Miscellaneous.protocol("           Stabilization patch selected manually is "
-                                       "too large, switch to automatic mode",
-                                       self.attached_log_file, precede_with_timestamp=False)
-                auto_execution = True
-            elif (y_high_opt - y_low_opt) / self.frames.shape[
-                0] < self.configuration.align_frames_min_stabilization_patch_fraction or (
-                    x_high_opt - x_low_opt) / self.frames.shape[
-                1] < self.configuration.align_frames_min_stabilization_patch_fraction and \
-                    self.configuration.global_parameters_protocol_level > 0:
-                Miscellaneous.protocol("           Stabilization patch selected manually is "
-                                       "too small, switch to automatic mode",
-                                       self.attached_log_file, precede_with_timestamp=False)
-                auto_execution = True
+            else:
+                # The size checks are applied independently of the protocol level. Only writing
+                # the message depends on it.
+                size_check = self.check_stabilization_patch_size(
+                    y_low_opt, y_high_opt, x_low_opt, x_high_opt, self.frames.shape,
+                    self.configuration.align_frames_min_stabilization_patch_fraction,
+                    self.configuration.align_frames_max_stabilization_patch_fraction)
+                if size_check is not None:
+                    if self.configuration.global_parameters_protocol_level > 0:
+                        Miscellaneous.protocol("           Stabilization patch selected manually is "
+                                               + size_check + ", switch to automatic mode",
+                                               self.attached_log_file, precede_with_timestamp=False)
+                    auto_execution = True
 
             # Compute the local rectangular patch in the image where the L gradient is highest
             # in both x and y direction. The scale factor specifies how much smaller the patch
@@ -573,13 +643,14 @@ class Workflow(QtCore.QObject):
                     self.align_frames.align_frames()
                     # Everything is fine, no need to try another stabilization patch.
                     break
-                except (NotSupportedError, ArgumentError) as e:
+                except NotSupportedError as e:
                     self.abort_job_signal.emit("Error: " + e.message + ", continuing with next job")
                     self.my_timer.stop('Global frame alignment')
                     return
-                # For some frames no valid shift could be computed. This would create problems later
-                # in the workflow. Therefore, try again with another stabilization patch.
-                except InternalError as e:
+                # For some frames no valid shift could be computed, or the stabilization patch
+                # drifted too close to the frame border. This would create problems later in the
+                # workflow. Therefore, try again with another stabilization patch.
+                except (InternalError, ArgumentError) as e:
                     if self.configuration.global_parameters_protocol_level > 0:
                         Miscellaneous.protocol("Warning: No valid shift computed at " + e.message +
                                                ", will try another stabilization patch",
@@ -866,7 +937,7 @@ class Workflow(QtCore.QObject):
             if self.configuration.global_parameters_protocol_level > 0:
                 self.my_timer.protocol(self.attached_log_file)
             if self.attached_log_file:
-                self.attached_log_file.close()
+                self.close_attached_log_file()
                 if self.attached_log_name_new and self.attached_log_name_new != self.attached_log_name:
                     # If a logfile with the new name exists, remove it.
                     try:
@@ -991,7 +1062,7 @@ class Workflow(QtCore.QObject):
         if self.configuration.global_parameters_protocol_level > 0:
             self.my_timer.protocol(self.attached_log_file)
         if self.attached_log_file:
-            self.attached_log_file.close()
+            self.close_attached_log_file()
             # If the attached log name was defined for a stacking job, rename it to include
             # parameter information.
             if self.attached_log_name_new and self.attached_log_name_new != self.attached_log_name:

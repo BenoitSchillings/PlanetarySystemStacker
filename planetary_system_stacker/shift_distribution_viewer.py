@@ -151,6 +151,10 @@ class ShiftDistributionViewerWidget(QtWidgets.QFrame, Ui_shift_distribution_view
         :return: -
         """
 
+        # Release the pyplot figure. Otherwise pyplot keeps a reference to it, and a new figure
+        # would accumulate each time the viewer is opened.
+        plt.close(self.matplotlib_widget.fig)
+
         # Remove the viewer widget from the main GUI and exit.
         self.parent_gui.display_widget(None, display=False)
         self.close()

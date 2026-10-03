@@ -21,6 +21,7 @@ along with PSS.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 import os
+import mmap
 import cv2
 import struct
 import datetime
@@ -33,6 +34,9 @@ class SERParser(object):
     __author_email__ = 'm.powalko@gmail.com'
     __version__ = '1.1'
     __name__ = 'SER parser for PlanetarySystemStacker tool (PSS)'
+
+    # Size of the fixed SER file header in bytes.
+    HEADER_SIZE = 178
 
     def __init__(self, ser_file, SER_16bit_shift_correction=True):
         """
@@ -53,17 +57,30 @@ class SERParser(object):
 
         self.header = self.read_header()
 
-        self.frame_count = self.header['FrameCount']
-
         self.frame_size = self.header['ImageWidth'] * \
                           self.header['ImageHeight'] * \
                           self.header['BytesPerPixel']
+
+        # Truncated captures (e.g. recording aborted, disk full) contain fewer frames than stated
+        # in the header. Clamp the frame count to the number of complete frames in the file.
+        file_size = os.fstat(self.fid.fileno()).st_size
+        self.frame_count = self.header['FrameCount']
+        if self.frame_size > 0:
+            self.frame_count = max(0, min(self.frame_count,
+                                          (file_size - self.HEADER_SIZE) // self.frame_size))
+        else:
+            self.frame_count = 0
 
         # This parameter is the number of unused bits in pixel values. It will be determined
         # experimentally later, based on a sample of frames. This is necessary because SER headers
         # often contain incorrect values for PixelDepthPerPlane. Often this value is set to 16, but
         # the image data only contain 8, 10 or 12 bits.
         self.shift_pixels = 0
+        self.shift_limit = 65535
+        self.shift_factor = (1., 1., 1., 1.)
+
+        # If True, 16bit pixel data are big-endian, and bytes are swapped in read operations.
+        self.byteswap = False
 
         if self.header['PixelDepthPerPlane'] <= 8:
             self.PixelDepthPerPlane = np.dtype(np.uint8)
@@ -71,6 +88,21 @@ class SERParser(object):
             # FireCapture uses "LittleEndian".
             # Until FireCatpure 2.7 this flag was not set properly.
             self.PixelDepthPerPlane = np.dtype(np.uint16).newbyteorder('<')
+
+        # Map the frame data area of the file into memory. Frames are returned as (read-only)
+        # views into this map, which avoids a seek / read / copy per frame.
+        self.mmap = None
+        self.frame_data = None
+        self.map_frame_data()
+
+        if self.header['PixelDepthPerPlane'] > 8:
+            # The "LittleEndian" header flag cannot be trusted: The SER specification (v3) says
+            # 1 = little-endian, but most capture programs (including the original Lucam recorder)
+            # write 0 for little-endian data. Therefore the flag is ignored and little-endian is
+            # kept as the default. Only if the image data strongly look big-endian, bytes are
+            # swapped (see "detect_big_endian").
+            # The (native) dtype is kept, the bytes of each frame are swapped when read.
+            self.byteswap = self.detect_big_endian()
 
             # Test how many of the 16 bits are not used. Set the parameter which is used from now
             # on to shift pixel values such that the full 16bit range is used.
@@ -95,6 +127,61 @@ class SERParser(object):
 
     def open_file(self, ser_file):
         return open(ser_file, 'rb')
+
+    def map_frame_data(self):
+        """
+        Create a memory map of the file and a numpy array view "frame_data" of the frame data area,
+        with shape (frame_count, height, width) or (frame_count, height, width, planes).
+
+        :return: -
+        """
+
+        if self.frame_count == 0:
+            return
+        self.mmap = mmap.mmap(self.fid.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.header['NumberOfPlanes'] == 1:
+            shape = (self.frame_count, self.header['ImageHeight'], self.header['ImageWidth'])
+        else:
+            shape = (self.frame_count, self.header['ImageHeight'], self.header['ImageWidth'],
+                     self.header['NumberOfPlanes'])
+        self.frame_data = np.frombuffer(self.mmap, dtype=self.PixelDepthPerPlane,
+                                        count=int(np.prod(shape)),
+                                        offset=self.HEADER_SIZE).reshape(shape)
+
+    def detect_big_endian(self):
+        """
+        Heuristic test whether 16bit pixel data are stored in big-endian byte order. Natural images
+        are smooth: Neighbouring pixels (of the same Bayer color, hence a stride of two) differ by
+        much less than the spread of pixel values. If the byte order is wrong, the noisy low byte
+        ends up in the high byte, and neighbouring values become essentially uncorrelated. Compare
+        this smoothness measure for both byte orders and only report big-endian if the swapped
+        version is much smoother. Note that for data using only one byte (8bit values in a 16bit
+        container) both measures are identical, and little-endian is kept.
+
+        :return: True, if the data are very likely big-endian; False otherwise.
+        """
+
+        if self.frame_data is None:
+            return False
+
+        def roughness(frame):
+            frame = frame.astype(np.float32)
+            std = frame.std()
+            if std == 0.:
+                return None
+            return np.abs(frame[:, 2:] - frame[:, :-2]).mean() / std
+
+        # Use a subsample of rows of the middle frame. Frames are 2D or 3D (planes last).
+        frame = self.frame_data[self.frame_count // 2][::4]
+        if frame.ndim == 3:
+            frame = frame[:, :, 0]
+        if frame.shape[1] < 3:
+            return False
+        r_native = roughness(frame)
+        r_swapped = roughness(frame.byteswap())
+        if r_native is None or r_swapped is None:
+            return False
+        return r_swapped < 0.25 * r_native
 
     def read_header(self):
         """
@@ -122,7 +209,7 @@ class SERParser(object):
 
         header = {key: value.decode('latin1') if isinstance(value, bytes) else
                   value for (key, value) in zip(KEYS, struct.unpack(
-                          '<14s 7i 40s 40s 40s 2q', self.fid.read(178)))}
+                          '<14s 7i 40s 40s 40s 2q', self.fid.read(self.HEADER_SIZE)))}
 
         if header['ColorID'] == 8:
             header['DebayerPattern'] = cv2.COLOR_BayerRG2BGR
@@ -135,7 +222,7 @@ class SERParser(object):
         else:
             header['DebayerPattern'] = None
 
-        header['ColorIDDecoded'] = ColorID[header['ColorID']]
+        header['ColorIDDecoded'] = ColorID.get(header['ColorID'], 'Unknown')
 
         if header['ColorID'] < 100:
             header['NumberOfPlanes'] = 1
@@ -171,15 +258,40 @@ class SERParser(object):
         except Exception:
             header['DateTime_UTC_Decoded'] = None
 
-        # Check, if FireCature metadata is available
+        # Check, if FireCature metadata is available. Malformed metadata are ignored, they must
+        # not prevent the file from being opened.
         if 'fps=' in header['Telescope']:
-            header['FPS'] = float(header['Telescope'].split('fps=')[1].split('gain')[0])
-            header['Gain'] = int(header['Telescope'].split('gain=')[1].split('exp')[0])
-            header['Exposure [ms]'] = float(header['Telescope'].split('exp=')[1].split('\x00')[0])
+            try:
+                header['FPS'] = float(header['Telescope'].split('fps=')[1].split('gain')[0])
+                header['Gain'] = int(header['Telescope'].split('gain=')[1].split('exp')[0])
+                header['Exposure [ms]'] = float(
+                    header['Telescope'].split('exp=')[1].split('\x00')[0])
+            except Exception:
+                pass
 
         self.frame_number = -1
 
         return header
+
+    def frame_view(self, frame_number=None):
+        """
+        Check the frame index and return a (read-only) view of the raw frame data in the memory map.
+
+        :param frame_number: Frame index (optional). If None, the next frame is returned.
+        :return: Numpy array view of the frame data (2D for one plane, 3D otherwise).
+        """
+
+        if frame_number is None:
+            frame_number = self.frame_number + 1
+
+        if not 0 <= frame_number < self.frame_count:
+            raise IOError('Error in reading SER frame, index: {0} is out of bounds'.format(frame_number))
+
+        self.frame_number = frame_number
+
+        if self.byteswap:
+            return self.frame_data[frame_number].byteswap()
+        return self.frame_data[frame_number]
 
     def read_frame_raw(self, frame_number=None):
         """
@@ -189,42 +301,17 @@ class SERParser(object):
         :return:    image_data: Multi dimmensional Numpy array containig image frame data.
         """
 
-        if frame_number is None:
-            frame_number = self.frame_number + 1
+        frame = self.frame_view(frame_number)
 
-        if 0 <= frame_number < self.frame_count:
-            if frame_number != self.frame_number + 1:
-                if frame_number == 0:
-                    self.fid.seek(178)
-                else:
-                    self.fid.seek(178 + frame_number * self.frame_size)
+        # If the pixel values do not use the full dynamic range, shift them accordingly.
+        if self.shift_pixels:
+            # The shift has been estimated from a sample of frames. If a pixel would overflow,
+            # saturate it at 65535 instead of wrapping around (i.e. multiply with saturation).
+            if frame.max() > self.shift_limit:
+                return cv2.multiply(frame, self.shift_factor)
+            return frame << self.shift_pixels
         else:
-            raise IOError('Error in reading SER frame, index: {0} is out of bounds'.format(frame_number))
-
-        self.frame_number = frame_number
-
-        if self.header['NumberOfPlanes'] == 1:
-            # If the pixel values do not use the full dynamic range, shift them accordingly.
-            if self.shift_pixels:
-                return np.frombuffer(self.fid.read(self.frame_size),
-                        dtype=self.PixelDepthPerPlane).reshape(
-                        self.header['ImageHeight'], self.header['ImageWidth']) << self.shift_pixels
-            else:
-                return np.frombuffer(self.fid.read(self.frame_size),
-                         dtype=self.PixelDepthPerPlane).reshape(
-                         self.header['ImageHeight'], self.header['ImageWidth'])
-        else:
-            if self.shift_pixels:
-                return np.frombuffer(self.fid.read(self.frame_size),
-                        dtype=self.PixelDepthPerPlane).reshape(
-                        self.header['ImageHeight'],
-                        self.header['ImageWidth'],
-                        self.header['NumberOfPlanes']) << self.shift_pixels
-            else:
-                return np.frombuffer(self.fid.read(self.frame_size),
-                    dtype=self.PixelDepthPerPlane).reshape(
-                    self.header['ImageHeight'], self.header['ImageWidth'],
-                    self.header['NumberOfPlanes'])
+            return frame
 
     def read_frame(self, frame_number=None):
         """
@@ -233,48 +320,18 @@ class SERParser(object):
         :return:    image_data: Multi dimmensional Numpy array containig image frame data.
         """
 
-        if frame_number is None:
-            frame_number = self.frame_number + 1
-
-        if 0 <= frame_number < self.frame_count:
-            if frame_number != self.frame_number + 1:
-                if frame_number == 0:
-                    self.fid.seek(178)
-                else:
-                    self.fid.seek(178 + frame_number * self.frame_size)
-        else:
-            raise IOError('Error in reading SER frame, index: {0} is out of bounds'.format(frame_number))
-
-        self.frame_number = frame_number
+        frame = self.frame_view(frame_number)
 
         if self.header['NumberOfPlanes'] == 1:
             if self.color:
-                return cv2.cvtColor(
-                        np.frombuffer(self.fid.read(self.frame_size),
-                        dtype=self.PixelDepthPerPlane).reshape(
-                        self.header['ImageHeight'],
-                        self.header['ImageWidth']),
-                        self.header['DebayerPattern'])
+                return cv2.cvtColor(frame, self.header['DebayerPattern'])
             else:
-                return np.frombuffer(self.fid.read(self.frame_size),
-                        dtype=self.PixelDepthPerPlane).reshape(
-                        self.header['ImageHeight'],
-                        self.header['ImageWidth'])
+                return frame
         else:
             if self.header['ColorID'] == 101:
-                return cv2.cvtColor(
-                        np.frombuffer(self.fid.read(self.frame_size),
-                        dtype=self.PixelDepthPerPlane).reshape(
-                        self.header['ImageHeight'],
-                        self.header['ImageWidth'],
-                        self.header['NumberOfPlanes']),
-                        cv2.COLOR_BGR2RGB)
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             else:
-                return np.frombuffer(self.fid.read(self.frame_size),
-                        dtype=self.PixelDepthPerPlane).reshape(
-                        self.header['ImageHeight'],
-                        self.header['ImageWidth'],
-                        self.header['NumberOfPlanes'])
+                return frame
 
     def read_all_frames(self):
         return [self.read_frame(idx) for idx in range(self.frame_count)]
@@ -282,27 +339,35 @@ class SERParser(object):
     def correct_dynamic_range(self):
         """
         Test if the pixel values in a sample of video frames use the full dynamic range of 16bit.
-        To this end, for three frames (first frame, middle frame, last frame) the maximal value
-        is determined. The "shift_pixels" parameter is set to the number of bits which are not used
-        in all the pixels tested. After the call to this method, calls to "read_frame_raw"
-        return frame values left-shifted by this number of bits.
+        To this end, for up to ten evenly spaced frames (including the first and last frame) the
+        maximal value is determined. The "shift_pixels" parameter is set to the number of bits
+        which are not used in all the pixels tested. After the call to this method, calls to
+        "read_frame_raw" return frame values left-shifted by this number of bits. Pixels in frames
+        outside the sample which would overflow are saturated at 65535.
 
         :return: -
         """
 
-        # If more than two frames are in the video, take a sample of three frames.
-        if self.frame_count > 2:
-            frame_ids = [0, int(self.frame_count / 2), self.frame_count-1]
-        else:
-            frame_ids = [0]
+        if self.frame_count == 0:
+            return
+
+        # Take a sample of up to ten evenly spaced frames.
+        frame_ids = np.unique(np.linspace(0, self.frame_count - 1,
+                                          min(10, self.frame_count)).astype(int))
 
         # Compute the maximal value of a (color) channel pixel within the sample.
-        max_pixel_value = max([np.max(self.read_frame_raw(frame_id)) for frame_id in frame_ids])
+        max_pixel_value = max([np.max(self.frame_view(frame_id)) for frame_id in frame_ids])
+        self.frame_number = -1
 
         # Compute the number of unused "head room" bits. Subsequent calls to "read_frame_raw"
         # will return pixel values left-shifted by this number.
         self.shift_pixels = 16 - int(max_pixel_value).bit_length()
         # print ("shift pixels: " + str(self.shift_pixels))
+
+        # Pixel values above "shift_limit" would overflow when shifted. In this case the shift is
+        # done as a saturating multiplication with "shift_factor" (one entry per OpenCV channel).
+        self.shift_limit = 65535 >> self.shift_pixels
+        self.shift_factor = (float(1 << self.shift_pixels),) * 4
 
     def read_trailer(self):
         """
@@ -313,21 +378,41 @@ class SERParser(object):
                                         time stamps in UTC. Otherwise "None"
         """
 
-        self.fid.seek(178 + self.frame_count * self.frame_size)
+        self.fid.seek(self.HEADER_SIZE + self.frame_count * self.frame_size)
 
         content = self.fid.read()
 
         self.frame_number = self.frame_count
 
-        if content:
-            return [datetime.datetime(1, 1, 1) + datetime.timedelta(
-                microseconds=value // 10) for value in struct.unpack(
-                        '<{0}Q'.format(self.frame_count), content)]
-        else:
+        # The trailer is missing or incomplete (e.g. truncated capture).
+        if self.frame_count < self.header['FrameCount'] or not content or \
+                len(content) < 8 * self.frame_count:
             return None
 
+        return [datetime.datetime(1, 1, 1) + datetime.timedelta(
+            microseconds=value // 10) for value in struct.unpack(
+                    '<{0}Q'.format(self.frame_count), content[:8 * self.frame_count])]
+
     def release(self):
+        """
+        Release the memory map and close the file. If frame views handed out earlier are still
+        alive, the map cannot be closed explicitly. It is then unmapped when the last view is
+        garbage collected.
+
+        :return: -
+        """
+
+        self.frame_data = None
+        if self.mmap is not None:
+            try:
+                self.mmap.close()
+            except BufferError:
+                pass
+            self.mmap = None
         self.fid.close()
+
+    def close(self):
+        self.release()
 
 
 if __name__ == "__main__":

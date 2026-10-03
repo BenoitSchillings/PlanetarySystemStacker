@@ -1,6 +1,7 @@
 from argparse import ArgumentParser, ArgumentTypeError
-from time import sleep
 from glob import glob
+from os.path import exists
+import sys
 
 from PyQt5 import QtCore
 
@@ -26,6 +27,21 @@ def noise_type(x):
     if not 0 <= x <= 11:
         raise ArgumentTypeError("Noise level must be between 0 and 11")
     return x
+
+
+def noise_to_gauss_width(noise):
+    """
+    Translate the "--noise" command line value into the Gaussian blur width used internally. The
+    mapping is the same as in the GUI configuration editor: The slider position is
+    int((width + 1) / 2) in the range 1..6, and the resulting width is 2 * position - 1. This way
+    the width is always odd (as required by the Gaussian blur) and between 1 and 11.
+
+    :param noise: Noise level as given on the command line (0..11)
+    :return: Gaussian blur width (odd integer between 1 and 11)
+    """
+
+    slider_value = min(max(int((noise + 1) / 2), 1), 6)
+    return 2 * slider_value - 1
 
 
 def stab_size_type(x):
@@ -144,9 +160,11 @@ class PssConsole(QtCore.QObject):
         parser = ArgumentParser()
         parser.add_argument("job_input", nargs='+', help="input video files or still image folders")
 
-        parser.add_argument("-p", "--protocol", action="store_true",
-                            help="Store protocol with results")
-        parser.add_argument("--protocol_detail", type=int, choices=[0, 1, 2], default=1,
+        parser.add_argument("-p", "--protocol", action="store_true", default=True,
+                            help="Store protocol with results (default)")
+        parser.add_argument("--no_protocol", dest="protocol", action="store_false",
+                            help="Do not store protocol with results")
+        parser.add_argument("--protocol_detail", type=int, choices=[0, 1, 2], default=2,
                             help="Protocol detail level")
         parser.add_argument("-b", "--buffering_level", choices=["auto", "0", "1", "2", "3", "4"],
                             default="auto", help="Buffering level")
@@ -173,7 +191,9 @@ class PssConsole(QtCore.QObject):
                                      "Edge Aware"],
                             default="Bilinear", help="Debayering method to be used")
         parser.add_argument("--noise", type=noise_type, default=7,
-                            help="Noise level (add Gaussian blur)")
+                            help="Noise level (add Gaussian blur), as displayed in the GUI. Even "
+                                 "values are rounded down to the next odd value, 0 is treated "
+                                 "as 1")
         parser.add_argument("-m", "--stab_mode", choices=["Surface", "Planet"], default="Surface",
                             help="Frame stabilization mode")
         parser.add_argument("--stab_size", type=stab_size_type, default=33,
@@ -244,7 +264,7 @@ class PssConsole(QtCore.QObject):
 
         self.configuration.frames_debayering_default = arguments.debayering
         self.configuration.frames_debayering_method = arguments.debayer_method
-        self.configuration.frames_gauss_width = arguments.noise
+        self.configuration.frames_gauss_width = noise_to_gauss_width(arguments.noise)
 
         self.configuration.align_frames_mode = arguments.stab_mode
         self.configuration.align_frames_rectangle_scale_factor = 100. / arguments.stab_size
@@ -304,7 +324,7 @@ class PssConsole(QtCore.QObject):
 
         # Create the job objects using the names passed as positional arguments.
         self.jobs = []
-        for name in [f for name in arguments.job_input for f in glob(name)]:
+        for name in [f for name in arguments.job_input for f in self.expand_job_name(name)]:
             try:
                 job = Job(name)
 
@@ -334,6 +354,7 @@ class PssConsole(QtCore.QObject):
                     "Error: No valid job specified, execution halted.",
                     self.workflow.attached_log_file)
             self.stop_execution()
+            return
 
         self.job_index = 0
 
@@ -503,12 +524,37 @@ class PssConsole(QtCore.QObject):
         print("Normalize frame brightness: " + str(arguments.normalize_bright))
         print("Normalization black cut-off: " + str(arguments.normalize_bco))
 
+    @staticmethod
+    def expand_job_name(name):
+        """
+        Expand a job name given on the command line. If a file or folder with exactly this name
+        exists, it is used as is. (File names may contain characters like "[" or "]" which glob
+        would interpret as patterns.) Otherwise the name is expanded with glob.
+
+        :param name: Job name as given on the command line (may contain wildcards)
+        :return: List of path names
+        """
+
+        if exists(name):
+            return [name]
+        return glob(name)
+
     def stop_execution(self):
         """
-        Halt the application. (There might be a more elegant way to do this!)
+        Halt the application: Wait until the workflow thread has finished its current activity,
+        stop it, and terminate the Qt event loop.
 
         :return: -
         """
-        # Wait a little before exiting, so that output buffers can be purged.
-        sleep(0.2)
-        quit(0)
+
+        # Stop the workflow thread. "wait" blocks until the current workflow activity (e.g. closing
+        # the log file after saving the last image) has terminated.
+        self.thread.quit()
+        self.thread.wait()
+        sys.stdout.flush()
+
+        # Terminate the Qt event loop. This method may be called before the event loop has been
+        # started (e.g. if no valid job was specified). In this case QCoreApplication.exit would
+        # be ignored. Therefore, the exit is scheduled to be executed as soon as the event loop
+        # runs.
+        QtCore.QTimer.singleShot(0, lambda: QtCore.QCoreApplication.exit(0))

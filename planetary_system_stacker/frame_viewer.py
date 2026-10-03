@@ -820,12 +820,40 @@ class FrameViewerWidget(QtWidgets.QFrame, Ui_frame_viewer):
 
         self.frame_player.run_player = False
 
+    def stop_player(self):
+        """
+        Stop the frame player (if it is running) and terminate the player thread. This method is
+        called whenever the widget is left (OK, Cancel, close / go back in the main GUI).
+
+        :return: -
+        """
+
+        self.frame_player.run_player = False
+        if self.player_thread.isRunning():
+            self.player_thread.quit()
+            self.player_thread.wait()
+
+    def closeEvent(self, event):
+        """
+        Make sure that the frame player thread is stopped when the widget is closed (e.g. if the
+        main GUI removes the widget when the user goes back in the workflow).
+
+        :param event: Close event
+        :return: -
+        """
+
+        self.stop_player()
+        event.accept()
+
     def done(self):
         """
         On exit from the frame viewer, update the stack frame size and send a completion signal.
 
         :return: -
         """
+
+        # Stop the frame player first, so that it does not interfere with the final updates.
+        self.stop_player()
 
         # Check if a new stack size was selected.
         if self.stack_size_changed is not None:
@@ -857,7 +885,6 @@ class FrameViewerWidget(QtWidgets.QFrame, Ui_frame_viewer):
             self.signal_finished.emit(self.signal_payload)
 
         # Close the Window.
-        self.player_thread.quit()
         plt.close()
         self.close()
 
@@ -868,12 +895,14 @@ class FrameViewerWidget(QtWidgets.QFrame, Ui_frame_viewer):
         :return: -
         """
 
+        # Stop the frame player before the workflow continues.
+        self.stop_player()
+
         # Send a completion message.
         if self.parent_gui is not None:
             self.signal_finished.emit(self.signal_payload)
 
         # Close the Window.
-        self.player_thread.quit()
         plt.close()
         self.close()
 

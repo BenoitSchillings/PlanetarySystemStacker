@@ -34,18 +34,19 @@ from cv2 import imread, VideoCapture, CAP_PROP_FRAME_COUNT, cvtColor, COLOR_RGB2
     GaussianBlur, Laplacian, CV_32F, COLOR_RGB2BGR, imwrite, convertScaleAbs, CAP_PROP_POS_FRAMES, \
     IMREAD_UNCHANGED, flip, COLOR_GRAY2RGB, COLOR_BayerRG2BGR, COLOR_BayerGR2BGR, \
     COLOR_BayerRG2BGR_VNG, COLOR_BayerGR2BGR_VNG, COLOR_BayerGB2BGR_VNG, COLOR_BayerBG2BGR_VNG, \
-    COLOR_BayerRG2BGR_EA, COLOR_BayerGR2BGR_EA, COLOR_BayerGB2BGR_EA, COLOR_BayerBG2BGR_EA
+    COLOR_BayerRG2BGR_EA, COLOR_BayerGR2BGR_EA, COLOR_BayerGB2BGR_EA, COLOR_BayerBG2BGR_EA, \
+    subtract, multiply, accumulate, extractChannel, CV_8U, CV_16U
 from cv2 import mean as cv_mean
 from numpy import max as np_max
 from numpy import min as np_min
 from numpy import sum as np_sum
 from numpy import uint8, uint16, int32, float32, clip, zeros, float64, where, average, moveaxis, \
-    unravel_index, ndarray
+    unravel_index, ndarray, left_shift
 
 import ser_parser
 from configuration import Configuration
 from exceptions import TypeError, ShapeError, ArgumentError, WrongOrderingError, Error, \
-    InternalError
+    InternalError, NotSupportedError
 from frames_old import FramesOld
 
 
@@ -104,7 +105,7 @@ def debayer_frame(frame_in, debayer_pattern='No change', debayer_method='Bilinea
     type_in = frame_in.dtype
 
     if type_in != uint8 and type_in != uint16:
-        raise Exception("Image type " + str(type_in) + " not supported")
+        raise TypeError("Image type " + str(type_in) + " not supported")
 
     # If the input frame is 3D, it represents a color image.
     color_in = len(frame_in.shape) == 3
@@ -136,7 +137,7 @@ def debayer_frame(frame_in, debayer_pattern='No change', debayer_method='Bilinea
 
         # Invalid debayer pattern specified.
         else:
-            raise Exception("Debayer pattern " + debayer_pattern + " not supported")
+            raise NotSupportedError("Debayer pattern " + debayer_pattern + " not supported")
 
     # Case B/W input image.
     else:
@@ -155,7 +156,7 @@ def debayer_frame(frame_in, debayer_pattern='No change', debayer_method='Bilinea
 
         # Invalid Bayer pattern specified.
         else:
-            raise Exception("Debayer pattern " + debayer_pattern + " not supported")
+            raise NotSupportedError("Debayer pattern " + debayer_pattern + " not supported")
 
     # Return the decoded image.
     return frame_out
@@ -451,6 +452,15 @@ class VideoReader(object):
                     self.bayer_pattern = self.cap.header['ColorIDDecoded']
                 else:
                     self.bayer_pattern = bayer_option_selected
+                # Some SER color formats (e.g. CMY Bayer patterns, ColorID 16-19) cannot be
+                # decoded. Report this to the user instead of failing later on.
+                if self.bayer_pattern not in ('Grayscale', 'RGB', 'BGR', 'Force Bayer RGGB',
+                                              'Force Bayer GRBG', 'Force Bayer GBRG',
+                                              'Force Bayer BGGR'):
+                    raise NotSupportedError("SER color format '" + self.bayer_pattern +
+                                            "' is not supported")
+            except NotSupportedError:
+                raise
             except:
                 raise IOError("Error in reading first video frame")
         else:
@@ -837,10 +847,13 @@ class Calibration(QtCore.QObject):
         else:
             raise InternalError("Cannot decide if input file is video or image directory")
 
-        # Sum all frames in a 64bit buffer.
+        # Sum all frames in a 64bit buffer. Close the reader (file / video capture) afterwards.
         master_frame_64 = zeros(input_shape, float64)
-        for index in range(frame_count):
-            master_frame_64 += reader.read_frame(index)
+        try:
+            for index in range(frame_count):
+                accumulate(reader.read_frame(index), master_frame_64)
+        finally:
+            reader.close()
 
         # Return the average frame in the format specified.
         if output_dtype == input_dtype:
@@ -956,9 +969,11 @@ class Calibration(QtCore.QObject):
                                                self.master_flat_frame - self.master_dark_frame,
                                                average_flat_frame)
 
-        # Compute the inverse master flat (float32) so that its entries are close to one.
+        # Compute the inverse master flat (float32) so that its entries are close to one. Replace
+        # zero (dead) pixels with the average to avoid division by zero.
         if average_flat_frame > 0:
-            self.inverse_master_flat_frame = (average_flat_frame / self.master_flat_frame).astype(
+            self.inverse_master_flat_frame = (average_flat_frame / where(
+                self.master_flat_frame > 0, self.master_flat_frame, average_flat_frame)).astype(
                 float32)
         else:
             self.reset_master_flat()
@@ -1008,8 +1023,10 @@ class Calibration(QtCore.QObject):
 
         self.dtype = frame_dtype
 
+        # The high value depends only on the frame type, also if no dark is available.
+        self.high_value = 255 if frame_dtype == uint8 else 65535
+
         if self.master_dark_frame is None:
-            self.high_value = None
             self.master_dark_frame_adapted = None
         elif frame_dtype == uint8:
             self.high_value = 255
@@ -1033,20 +1050,22 @@ class Calibration(QtCore.QObject):
         if self.master_dark_frame_adapted is None and self.inverse_master_flat_frame is None:
             return frame
 
+        # OpenCV operations saturate at 0 and at the type's high value, and the result has the
+        # type of the input frame (uint8 or uint16).
+        cv_dtype = CV_8U if frame.dtype == uint8 else CV_16U
+
         # Case only flats are available:
-        elif self.master_dark_frame_adapted is None:
-            return (frame * self.inverse_master_flat_frame).astype(self.dtype)
+        if self.master_dark_frame_adapted is None:
+            return multiply(frame, self.inverse_master_flat_frame, dtype=cv_dtype)
 
         # Case only darks are available:
         elif self.inverse_master_flat_frame is None:
-            return where(frame > self.master_dark_frame_adapted,
-                         frame - self.master_dark_frame_adapted, 0)
+            return subtract(frame, self.master_dark_frame_adapted)
 
         # Case both darks and flats are available:
         else:
-            return clip(
-                (frame - self.master_dark_frame_adapted) * self.inverse_master_flat_frame,
-                0., self.high_value).astype(self.dtype)
+            return multiply(subtract(frame, self.master_dark_frame_adapted),
+                            self.inverse_master_flat_frame, dtype=cv_dtype)
 
 
 class Frames(object):
@@ -1422,7 +1441,8 @@ class Frames(object):
                 if self.color_index == 3:
                     frame_mono = cvtColor(frame_original, COLOR_RGB2GRAY)
                 else:
-                    frame_mono = frame_original[:, :, self.color_index]
+                    # Extract a contiguous copy, so that the color frame is not kept alive.
+                    frame_mono = extractChannel(frame_original, self.color_index)
             # Frames are in B/W mode already
             else:
                 frame_mono = frame_original
@@ -1503,7 +1523,7 @@ class Frames(object):
 
             # If the mono image is 8bit, interpolate it to 16bit.
             if frame_mono.dtype == uint8:
-                frame_mono = frame_mono.astype(uint16) * 256
+                frame_mono = left_shift(frame_mono, 8, dtype=uint16)
 
             # Compute a version of the frame with Gaussian blur added.
             frame_monochrome_blurred = GaussianBlur(frame_mono,
@@ -1661,7 +1681,7 @@ class Frames(object):
         """
 
         # Handle the special case of .fits files first.
-        if Path(filename).suffix == '.fits':
+        if Path(filename).suffix.lower() in ('.fit', '.fits'):
             # Flip image horizontally to preserve orientation
             image = flip(image, 0)
             if color:
@@ -1707,8 +1727,9 @@ class Frames(object):
                 if not Path(filename).suffix:
                     filename += '.png'
 
-            if Path(filename).suffix not in ['.tiff', '.png']:
-                raise TypeError("Attempt to write image format other than '.tiff' or '.png'")
+            if Path(filename).suffix.lower() not in ('.tiff', '.tif', '.png'):
+                raise TypeError("Attempt to write image format other than '.tiff', '.tif' or "
+                                "'.png'")
 
             # Write the image to the file. Before writing, convert the internal RGB representation
             # into the BGR representation assumed by OpenCV.
@@ -1741,6 +1762,10 @@ class Frames(object):
             # To process this data in PSS, do "round()" and convert numpy array to "np.uint16"
             if image.dtype == '>f4':
                 image = image.round().astype(uint16)
+
+            # FITS data are big-endian. OpenCV only accepts native byte order.
+            if not image.dtype.isnative:
+                image = image.astype(image.dtype.newbyteorder('='))
 
             # If color image, move axis to be able to process the content
             if len(image.shape) == 3:

@@ -24,7 +24,7 @@ from copy import copy, deepcopy
 from math import sqrt
 from pathlib import Path
 from sys import argv, stdout, stderr
-from time import sleep
+from threading import Event, RLock
 
 import psutil
 from PyQt5 import QtWidgets, QtCore
@@ -41,6 +41,10 @@ from miscellaneous import Miscellaneous
 from postproc_editor_gui import Ui_postproc_editor
 from sharpening_layer_widget import Ui_sharpening_layer_widget
 from version_manager_widget import Ui_version_manager_widget
+
+# The ImageProcessor and BlinkComparator threads both compute and store version images. This lock
+# serializes their access to the version objects (in particular to "version.image").
+version_image_lock = RLock()
 
 
 class SharpeningLayerWidget(QtWidgets.QWidget, Ui_sharpening_layer_widget):
@@ -605,6 +609,9 @@ class BlinkComparator(QtCore.QThread):
         # Initially, no version is shown by the blink comparator.
         self.variant_shown_signal.emit(False, False)
 
+        # This event is set to request the (cooperative) termination of the thread.
+        self.stop_event = Event()
+
         # Start the comparator thread.
         self.start()
 
@@ -620,36 +627,52 @@ class BlinkComparator(QtCore.QThread):
         show_selected_version = True
 
         # Begin main loop.
-        while self.postproc_data_object.blinking:
-            # Show the "selected" version.
-            if show_selected_version:
-                # In case the blink comparator is invoked during manual RGB shift corrections,
-                # produce a final image of the selected version before blinking.
-                self.postproc_data_object.finalize_postproc_version()
-                self.set_photo_signal.emit(self.postproc_data_object.version_selected)
-                self.variant_shown_signal.emit(True, False)
-            # Show the "compared" version.
+        while self.postproc_data_object.blinking and not self.stop_event.is_set():
+            # In case the blink comparator is invoked during manual RGB shift corrections,
+            # produce a final image of the version before showing it. Wait for the lock (the
+            # ImageProcessor might be computing a new image), but react to a stop request.
+            while not version_image_lock.acquire(timeout=0.05):
+                if self.stop_event.is_set():
+                    break
             else:
-                self.postproc_data_object.finalize_postproc_version(
-                    version_index=self.postproc_data_object.version_compared)
-                self.set_photo_signal.emit(self.postproc_data_object.version_compared)
-                self.variant_shown_signal.emit(False, True)
+                try:
+                    # Show the "selected" version.
+                    if show_selected_version:
+                        self.postproc_data_object.finalize_postproc_version()
+                        self.set_photo_signal.emit(self.postproc_data_object.version_selected)
+                        self.variant_shown_signal.emit(True, False)
+                    # Show the "compared" version.
+                    else:
+                        self.postproc_data_object.finalize_postproc_version(
+                            version_index=self.postproc_data_object.version_compared)
+                        self.set_photo_signal.emit(self.postproc_data_object.version_compared)
+                        self.variant_shown_signal.emit(False, True)
+                finally:
+                    version_image_lock.release()
 
             # Toggle back and forth between first and second image version.
             show_selected_version = not show_selected_version
 
-            # Sleep time inserted to limit CPU consumption by idle looping.
-            sleep(self.postproc_blinking_period)
+            # Sleep time inserted to limit CPU consumption by idle looping. Wake up immediately if
+            # a stop is requested.
+            self.stop_event.wait(self.postproc_blinking_period)
+
+        # Leave the display in the "not blinking" state. Since these signals are queued after
+        # all signals emitted by this thread before, they cannot be overridden by them.
+        self.set_photo_signal.emit(self.postproc_data_object.version_selected)
+        self.variant_shown_signal.emit(False, False)
 
     def stop(self):
         """
-        Terminate the blink comparator thread.
+        Stop the blink comparator thread cooperatively and wait until it has finished.
 
         :return: -
         """
 
         self.variant_shown_signal.emit(False, False)
-        self.terminate()
+        self.stop_event.set()
+        self.quit()
+        self.wait()
 
 
 class ImageProcessor(QtCore.QThread):
@@ -685,6 +708,9 @@ class ImageProcessor(QtCore.QThread):
         # Extract the file name from its path.
         self.file_name = Path(self.postproc_data_object.file_name_original).name
 
+        # This event is set to request the (cooperative) termination of the thread.
+        self.stop_event = Event()
+
         self.start()
 
     def run(self):
@@ -714,57 +740,78 @@ class ImageProcessor(QtCore.QThread):
             self.auto_rgb_aligned_images_original_hsv = [None, None, None]
         self.auto_rgb_shifts_red = [None, None, None]
         self.auto_rgb_shifts_blue = [None, None, None]
+        # For each resolution level remember the Gaussian blur width used in auto-alignment. If
+        # the width changes, the auto-aligned image must be recomputed.
+        self.auto_rgb_gauss_widths = [None, None, None]
+
+        # For versions with auto-RGB alignment, remember the parameters (resolution index, Gauss
+        # width) with which the current image was computed. Key: version index.
+        self.last_auto_rgb_parameters = {}
 
         # Initialize images for all versions using the current layer data.
         self.last_version_layers = []
 
-        for version in self.postproc_data_object.versions:
-            # For every version, keep a copy of the current layer parameters for later checks for
-            # changes. Also, remember if for this version RGB alignment was active.
-            self.last_version_layers.append(deepcopy(version.layers))
-            version.last_rgb_automatic = version.rgb_automatic
+        for version_index, version in enumerate(self.postproc_data_object.versions):
+            # Stop the initialization if the thread is to be terminated.
+            if self.stop_event.is_set():
+                return
+            version_image_lock.acquire()
+            try:
+                # For every version, keep a copy of the current layer parameters for later checks
+                # for changes. Also, remember if for this version RGB alignment was active.
+                self.last_version_layers.append(deepcopy(version.layers))
+                version.last_rgb_automatic = version.rgb_automatic
 
-            # If automatic RGB alignment is selected for this version, compute the shifted
-            # original image for this version's resolution if not yet available.
-            if version.rgb_automatic:
-                if self.auto_rgb_aligned_images_original[version.rgb_resolution_index] is None:
-                    try:
-                        self.auto_rgb_aligned_images_original[version.rgb_resolution_index], \
-                        self.auto_rgb_shifts_red[version.rgb_resolution_index], \
-                        self.auto_rgb_shifts_blue[
-                            version.rgb_resolution_index] = Miscellaneous.auto_rgb_align(
-                            self.image_original, self.configuration.postproc_max_shift,
-                            interpolation_factor=[1, 2, 4][version.rgb_resolution_index],
-                            blur_strength=version.rgb_gauss_width)
-                        if self.color:
-                            self.auto_rgb_aligned_images_original_hsv[
-                                version.rgb_resolution_index] = cvtColor(
-                                self.auto_rgb_aligned_images_original[version.rgb_resolution_index],
-                                COLOR_BGR2HSV)
-                    except:
-                        self.auto_rgb_aligned_images_original[
-                            version.rgb_resolution_index] = self.image_original
-                        self.auto_rgb_shifts_red[version.rgb_resolution_index] = (0., 0.)
-                        self.auto_rgb_shifts_blue[version.rgb_resolution_index] = (0., 0.)
-                        if self.color:
-                            self.auto_rgb_aligned_images_original_hsv[
-                                version.rgb_resolution_index] = self.image_original_hsv
+                # If automatic RGB alignment is selected for this version, compute the shifted
+                # original image for this version's resolution if not yet available.
+                if version.rgb_automatic:
+                    self.last_auto_rgb_parameters[version_index] = (version.rgb_resolution_index,
+                                                                    version.rgb_gauss_width)
+                    if self.auto_rgb_aligned_images_original[
+                        version.rgb_resolution_index] is None or self.auto_rgb_gauss_widths[
+                        version.rgb_resolution_index] != version.rgb_gauss_width:
+                        self.auto_rgb_gauss_widths[version.rgb_resolution_index] = \
+                            version.rgb_gauss_width
+                        try:
+                            self.auto_rgb_aligned_images_original[version.rgb_resolution_index], \
+                            self.auto_rgb_shifts_red[version.rgb_resolution_index], \
+                            self.auto_rgb_shifts_blue[
+                                version.rgb_resolution_index] = Miscellaneous.auto_rgb_align(
+                                self.image_original, self.configuration.postproc_max_shift,
+                                interpolation_factor=[1, 2, 4][version.rgb_resolution_index],
+                                blur_strength=version.rgb_gauss_width)
+                            if self.color:
+                                self.auto_rgb_aligned_images_original_hsv[
+                                    version.rgb_resolution_index] = cvtColor(
+                                    self.auto_rgb_aligned_images_original[version.rgb_resolution_index],
+                                    COLOR_BGR2HSV)
+                        except:
+                            self.auto_rgb_aligned_images_original[
+                                version.rgb_resolution_index] = self.image_original
+                            self.auto_rgb_shifts_red[version.rgb_resolution_index] = (0., 0.)
+                            self.auto_rgb_shifts_blue[version.rgb_resolution_index] = (0., 0.)
+                            if self.color:
+                                self.auto_rgb_aligned_images_original_hsv[
+                                    version.rgb_resolution_index] = self.image_original_hsv
 
-                version.image = Miscellaneous.post_process(
-                    self.auto_rgb_aligned_images_original[version.rgb_resolution_index],
-                    version.layers)
-            # If shifts were set manually, apply them before sharpening the input image.
-            elif version.shift_red != (0., 0.) or version.shift_blue != (0., 0.):
-                # Shift the image with the resolution given by the selected interpolation factor.
-                interpolation_factor = [1, 2, 4][version.rgb_resolution_index]
-                shifted_image = Miscellaneous.shift_colors(self.image_original,
-                                                          version.shift_red, version.shift_blue,
-                                                          interpolate_input=interpolation_factor,
-                                                          reduce_output=interpolation_factor)
-                version.image = Miscellaneous.post_process(shifted_image, version.layers)
-            # No RGB corrections were specified.
-            else:
-                version.image = Miscellaneous.post_process(self.image_original, version.layers)
+                    version.image = Miscellaneous.post_process(
+                        self.auto_rgb_aligned_images_original[version.rgb_resolution_index],
+                        version.layers)
+                # If shifts were set manually, apply them before sharpening the input image.
+                elif version.shift_red != (0., 0.) or version.shift_blue != (0., 0.):
+                    # Shift the image with the resolution given by the selected interpolation factor.
+                    interpolation_factor = [1, 2, 4][version.rgb_resolution_index]
+                    shifted_image = Miscellaneous.shift_colors(self.image_original,
+                                                              version.shift_red, version.shift_blue,
+                                                              interpolate_input=interpolation_factor,
+                                                              reduce_output=interpolation_factor)
+                    version.image = Miscellaneous.post_process(shifted_image, version.layers)
+                # No RGB corrections were specified.
+                else:
+                    version.image = Miscellaneous.post_process(self.image_original, version.layers)
+
+            finally:
+                version_image_lock.release()
 
         # Initialize lists for intermediate results (to speed up image updates). The efficient
         # reuse of intermediate results is only possible if there is enough RAM.
@@ -787,16 +834,26 @@ class ImageProcessor(QtCore.QThread):
         # Initialize Exception state.
         exception_status = False
 
-        # Enter the main loop and wait for parameter changes in the version selected.
-        while True:
+        # Enter the main loop and wait for parameter changes in the version selected. Leave the
+        # loop when the thread is stopped.
+        while not self.stop_event.is_set():
+
+            # If nothing is to be done in this pass, the thread sleeps before the next pass.
+            idle = False
 
             # The whole computation is enclosed in a try/except block. If something goes wrong, e.g.
             # because during the execution of a loop pass the postproc_data_object was changed by
-            # the GUI thread, the ImageProcessor tries again in the next pass.
+            # the GUI thread, the ImageProcessor tries again in the next pass. While the pass is
+            # executed, the BlinkComparator must not change version images.
+            version_image_lock.acquire()
             try:
-                # To avoid chasing a moving target, copy the parameters of the currently active version
+                # To avoid chasing a moving target, copy the parameters of the currently active
+                # version. Only the parameters are copied (the layers in depth), not the image
+                # arrays. The images are only read below and never modified in place.
                 self.version_selected = self.postproc_data_object.version_selected
-                postproc_version = deepcopy(self.postproc_data_object.versions[self.version_selected])
+                postproc_version = copy(self.postproc_data_object.versions[self.version_selected])
+                postproc_version.layers = deepcopy(postproc_version.layers)
+                postproc_version.images_uncorrected = list(postproc_version.images_uncorrected)
                 self.layers_selected = postproc_version.layers
                 self.rgb_automatic = postproc_version.rgb_automatic
                 self.rgb_resolution_index = postproc_version.rgb_resolution_index
@@ -821,10 +878,24 @@ class ImageProcessor(QtCore.QThread):
                     compute_new_image = True
 
                 # If automatic RGB alignment is on, check if the shifted image for the current
-                # resolution has been computed already. Otherwise, compute it now.
+                # resolution has been computed already with the current Gauss width. Otherwise,
+                # compute it now.
                 if self.rgb_automatic:
+                    # If the resolution or the Gauss width have changed since the image of this
+                    # version was computed, the pipeline input changes. Invalidate all
+                    # intermediate results.
+                    auto_rgb_parameters = (self.rgb_resolution_index, self.rgb_gauss_width)
+                    if self.last_auto_rgb_parameters.get(
+                            self.version_selected) != auto_rgb_parameters:
+                        self.last_auto_rgb_parameters[self.version_selected] = auto_rgb_parameters
+                        self.reset_intermediate_images()
+                        compute_new_image = True
+
                     if self.auto_rgb_aligned_images_original[
-                        self.rgb_resolution_index] is None:
+                        self.rgb_resolution_index] is None or self.auto_rgb_gauss_widths[
+                        self.rgb_resolution_index] != self.rgb_gauss_width:
+                        self.auto_rgb_gauss_widths[self.rgb_resolution_index] = \
+                            self.rgb_gauss_width
 
                         # Change the main GUI's status bar to show that a computation is going on.
                         self.set_status_bar_signal.emit("Postprocessing " + self.file_name +
@@ -1056,7 +1127,7 @@ class ImageProcessor(QtCore.QThread):
 
                 # Idle loop before doing the next check for updates.
                 else:
-                    sleep(self.postproc_idle_loop_time)
+                    idle = True
 
                 # Reset any exception condition after a successful loop pass.
                 exception_status = False
@@ -1068,7 +1139,14 @@ class ImageProcessor(QtCore.QThread):
                     print ("Exception in ImageProcessor: " + str(e) + ". Will try again.",
                            file=stderr)
                     exception_status = True
-                sleep(self.postproc_idle_loop_time)
+                idle = True
+
+            finally:
+                version_image_lock.release()
+
+            # Sleep outside the lock. Wake up immediately if a stop is requested.
+            if idle:
+                self.stop_event.wait(self.postproc_idle_loop_time)
 
     def reset_intermediate_images(self):
         """
@@ -1081,6 +1159,21 @@ class ImageProcessor(QtCore.QThread):
         self.layer_gauss = [None] * (self.configuration.postproc_max_layers)
         self.layer_bilateral = [None] * (self.configuration.postproc_max_layers)
         self.layer_denoised = [None] * (self.configuration.postproc_max_layers)
+
+    def invalidate_layers_above(self, layer_index):
+        """
+        The input image for layer "layer_index + 1" has changed. Invalidate it, and all intermediate
+        results of the layers above "layer_index", because they depend on it.
+
+        :param layer_index: Index of the layer the output of which has changed.
+        :return: -
+        """
+
+        for index in range(layer_index + 1, len(self.layer_input)):
+            self.layer_input[index] = None
+        for index in range(layer_index + 1, len(self.layer_gauss)):
+            self.layer_gauss[index] = self.layer_bilateral[index] = \
+                self.layer_denoised[index] = None
 
     def new_computation_required(self, version_has_changed):
         """
@@ -1141,16 +1234,19 @@ class ImageProcessor(QtCore.QThread):
                     change_detected = True
 
                 # If the radius has changed, all filters at this level and the input for the next
-                # level have to be recomputed.
+                # level (and therefore all results on higher levels) have to be recomputed.
                 if  last_layer.radius != layer_selected.radius:
                     self.layer_gauss[layer_index] = self.layer_bilateral[layer_index] = \
-                        self.layer_denoised[layer_index] = self.layer_input[layer_index + 1] = None
+                        self.layer_denoised[layer_index] = None
+                    self.invalidate_layers_above(layer_index)
                     change_detected = True
 
-                # If the bi_fraction has changed, the input for the next layer and the denoised
-                # component on this layer must be recomputed.
+                # If the bi_fraction has changed, the input for the next layer (and therefore all
+                # results on higher levels) and the denoised component on this layer must be
+                # recomputed.
                 if last_layer.bi_fraction != layer_selected.bi_fraction:
-                    self.layer_denoised[layer_index] = self.layer_input[layer_index + 1] = None
+                    self.layer_denoised[layer_index] = None
+                    self.invalidate_layers_above(layer_index)
                     change_detected = True
 
                 # If the bi_range parameter has changed, the bilateral filter is invalidated.
@@ -1158,9 +1254,11 @@ class ImageProcessor(QtCore.QThread):
                     self.layer_bilateral[layer_index] = None
                     change_detected = True
                     # If the bi_fraction parameter is not zero, the change propagates to the
-                    # denoised component and the input for the next level.
+                    # denoised component and the input for the next level (and therefore to all
+                    # results on higher levels).
                     if abs(layer_selected.bi_fraction) > 1.e-5:
-                        self.layer_denoised[layer_index] = self.layer_input[layer_index + 1] = None
+                        self.layer_denoised[layer_index] = None
+                        self.invalidate_layers_above(layer_index)
 
                 # If the denoise parameter has changed, the denoised component for this layer is
                 # invalidated.
@@ -1256,11 +1354,15 @@ class ImageProcessor(QtCore.QThread):
 
     def stop(self):
         """
-        Terminate the ImageProcessor.
+        Stop the ImageProcessor cooperatively: The main loop is left after the current pass. Wait
+        until the thread has finished.
+
         :return: -
         """
 
-        self.terminate()
+        self.stop_event.set()
+        self.quit()
+        self.wait()
 
 
 class PostprocEditorWidget(QtWidgets.QFrame, Ui_postproc_editor):
@@ -1806,11 +1908,12 @@ class PostprocEditorWidget(QtWidgets.QFrame, Ui_postproc_editor):
         # In case "correction mode" is on, process the current version image in full 16bit
         # resolution.
         self.disable_widgets()
+
+        # Terminate the image processor thread first, so that it does not change version images
+        # concurrently with the finalization below.
+        self.image_processor.stop()
         self.finish_rgb_correction_mode()
         self.postproc_data_object.finalize_postproc_version()
-
-        # Terminate the image processor thread.
-        self.image_processor.stop()
         self.configuration.write_config()
         if self.signal_save_postprocessed_image:
             self.signal_save_postprocessed_image.emit(self.postproc_data_object.versions[

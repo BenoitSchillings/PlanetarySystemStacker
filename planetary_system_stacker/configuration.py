@@ -89,9 +89,9 @@ class ConfigurationParameters(object):
         self.hidden_parameters_main_window_maximized = False
         self.global_parameters_display_quickstart = True
         self.global_parameters_version = PSS_Version
-        self.global_parameters_protocol_level = 1
+        self.global_parameters_protocol_level = 2
         self.global_parameters_write_protocol_to_file = False
-        self.global_parameters_store_protocol_with_result = False
+        self.global_parameters_store_protocol_with_result = True
         self.global_parameters_buffering_level = -1
         self.global_parameters_maximum_memory_active = False
         self.global_parameters_maximum_memory_amount = \
@@ -422,6 +422,12 @@ class Configuration(object):
             self.global_parameters_write_protocol_to_file
         configuration_parameters.global_parameters_store_protocol_with_result = \
             self.global_parameters_store_protocol_with_result
+        configuration_parameters.global_parameters_buffering_level = \
+            self.global_parameters_buffering_level
+        configuration_parameters.global_parameters_maximum_memory_active = \
+            self.global_parameters_maximum_memory_active
+        configuration_parameters.global_parameters_maximum_memory_amount = \
+            self.global_parameters_maximum_memory_amount
         configuration_parameters.global_parameters_include_postprocessing = \
             self.global_parameters_include_postprocessing
         configuration_parameters.global_parameters_image_format = \

@@ -256,7 +256,12 @@ class AlignmentPoints(object):
                 alignment_point['structure'] for alignment_point in self.alignment_points)
             alignment_points_dropped_structure_indices = []
             for alignment_point_index, alignment_point in enumerate(self.alignment_points):
-                alignment_point['structure'] /= structure_max
+                # If no AP box has any structure, avoid a division by zero (NaN). In this case all
+                # APs have the same (maximal) relative structure, and they are kept.
+                if structure_max > 0.:
+                    alignment_point['structure'] /= structure_max
+                else:
+                    alignment_point['structure'] = 1.
                 # Remove alignment points with too little structure and increment the counter.
                 if alignment_point['structure'] < structure_threshold:
                     alignment_points_dropped_structure_indices.append(alignment_point_index)
@@ -312,16 +317,18 @@ class AlignmentPoints(object):
 
         alignment_point['patch_y_low'] = y - self.configuration.alignment_points_half_patch_width
         alignment_point['patch_y_high'] = y + self.configuration.alignment_points_half_patch_width
+        # Both conditions are checked independently: If there is only one AP row (column), its
+        # patches have to be extended to both frame borders.
         if extend_y_low:
             alignment_point['patch_y_low'] = 0
-        elif extend_y_high:
+        if extend_y_high:
             alignment_point['patch_y_high'] = self.num_pixels_y
 
         alignment_point['patch_x_low'] = x - self.configuration.alignment_points_half_patch_width
         alignment_point['patch_x_high'] = x + self.configuration.alignment_points_half_patch_width
         if extend_x_low:
             alignment_point['patch_x_low'] = 0
-        elif extend_x_high:
+        if extend_x_high:
             alignment_point['patch_x_high'] = self.num_pixels_x
 
         # Initialize the reference to the corresponding widget in the AP viewer scene.
@@ -602,9 +609,11 @@ class AlignmentPoints(object):
         :return: -
         """
 
-        # If the user has entered a value for the number of frames, use it.
+        # If the user has entered a value for the number of frames, use it. It cannot be larger
+        # than the number of frames available.
         if self.configuration.alignment_points_frame_number > 0:
-            self.stack_size = self.configuration.alignment_points_frame_number
+            self.stack_size = min(self.configuration.alignment_points_frame_number,
+                                  self.frames.number)
         # Otherwise compute the stack size from the given percentage. Take at least one frame.
         else:
             self.stack_size = max(int(ceil(
@@ -639,7 +648,7 @@ class AlignmentPoints(object):
                 frame = self.frames.frames_mono_blurred(frame_index)
 
                 # After every "signal_step_size"th frame, send a progress signal to the main GUI.
-                if self.progress_signal is not None and frame_index % self.signal_step_size == 1:
+                if self.progress_signal is not None and frame_index % self.signal_step_size == 0:
                     self.progress_signal.emit("Rank frames at APs",
                                     int(round(10 * frame_index / self.signal_loop_length) * 10))
 
@@ -674,7 +683,7 @@ class AlignmentPoints(object):
                 frame = self.frames.frames_mono_blurred_laplacian(frame_index)
 
                 # After every "signal_step_size"th frame, send a progress signal to the main GUI.
-                if self.progress_signal is not None and frame_index % self.signal_step_size == 1:
+                if self.progress_signal is not None and frame_index % self.signal_step_size == 0:
                     self.progress_signal.emit("Rank frames at APs",
                                         int(round(10 * frame_index / self.signal_loop_length) * 10))
 

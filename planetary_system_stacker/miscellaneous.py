@@ -33,6 +33,8 @@ from numpy import diff, average, hypot, sqrt, unravel_index, argmax, zeros, aran
     empty, argmin, stack, sin, uint8, float32, uint16, full
 from math import exp
 from numpy import min as np_min
+from numpy import outer, hanning, result_type, ascontiguousarray, pad
+from numpy.lib.stride_tricks import sliding_window_view
 from numpy.fft import fft2, ifft2
 from numpy.linalg import solve
 from scipy.ndimage import sobel
@@ -146,7 +148,7 @@ class Miscellaneous(object):
         dy = sobel(frame_int32, 1)  # horizontal derivative
         mag = hypot(dx, dy)  # magnitude
 
-        return mag.sum(axis=0)
+        return mag.sum()
 
     @staticmethod
     def local_contrast(frame, stride):
@@ -179,13 +181,21 @@ class Miscellaneous(object):
                  frame_1 must be shifted by this amount to register with frame_0.
         """
 
+        # Remove the mean and apply a Hanning window to suppress the discontinuities at the patch
+        # borders. Otherwise, brightness gradients across the patch (e.g. at the lunar terminator)
+        # produce a spurious peak at zero shift.
+        window = outer(hanning(shape[0]), hanning(shape[1]))
+        frame_0 = (frame_0 - frame_0.mean()) * window
+        frame_1 = (frame_1 - frame_1.mean()) * window
+
         # Compute the fast Fourier transforms of both frames.
         f0 = fft2(frame_0)
         f1 = fft2(frame_1)
 
         # Compute the phase correlation. The resulting image has a bright peak at the pixel location
-        # which corresponds to the shift vector.
-        ir = abs(ifft2((f0 * f1.conjugate()) / (abs(f0) * abs(f1))))
+        # which corresponds to the shift vector. A small epsilon avoids division by zero.
+        cross_power = f0 * f1.conjugate()
+        ir = abs(ifft2(cross_power / (abs(cross_power) + 1.e-10)))
 
         # Compute the pixel coordinates of the image maximum.
         ty, tx = unravel_index(argmax(ir), shape)
@@ -278,9 +288,10 @@ class Miscellaneous(object):
                                                 (blurr_strength_first_phase,
                                                  blurr_strength_first_phase), 0)
 
-        # Compute the normalized cross correlation.
-        result = matchTemplate((frame_window_first_phase).astype(float32),
-                               reference_box_first_phase.astype(float32), TM_CCORR_NORMED)
+        # Compute the normalized cross correlation. Avoid copying arrays which are float32 already.
+        result = matchTemplate(frame_window_first_phase.astype(float32, copy=False),
+                               reference_box_first_phase.astype(float32, copy=False),
+                               TM_CCORR_NORMED)
 
         # Determine the position of the maximum correlation and compute the corresponding warp
         # shift. The factor of 2 transforms the shift to the fine pixel grid. If a non-trivial
@@ -313,8 +324,9 @@ class Miscellaneous(object):
 
             # Perform the template matching on the fine grid, again using normalized cross
             # correlation.
-            result = matchTemplate(frame_window_second_phase.astype(float32),
-                                   reference_box_second_phase, TM_CCORR_NORMED)
+            result = matchTemplate(frame_window_second_phase.astype(float32, copy=False),
+                                   reference_box_second_phase.astype(float32, copy=False),
+                                   TM_CCORR_NORMED)
 
             # Find the position of the local optimum and compute the corresponding shift values.
             minVal, maxVal, minLoc, maxLoc = minMaxLoc(result)
@@ -390,38 +402,53 @@ class Miscellaneous(object):
         dev_r = []
         deviations = zeros((2 * search_width + 1, 2 * search_width + 1))
 
+        # Down-sample the reference box only once.
+        reference_box_strided = reference_box[::sampling_stride, ::sampling_stride]
+
+        # If the complete search area lies within the frame, create a (non-copying) view which
+        # contains the frame boxes for all shifts. The box for shift [dy, dx] is
+        # frame_windows[search_width - dy, search_width - dx]. This way, the deviations for all
+        # shifts on a circle can be computed with a single vectorized operation. Otherwise, fall
+        # back to computing the deviations one shift at a time.
+        if y_low - search_width >= 0 and x_low - search_width >= 0 and \
+                y_high + search_width <= frame.shape[0] and \
+                x_high + search_width <= frame.shape[1]:
+            # Convert the frame area to the data type of the differences once, so that the
+            # differences can be computed in place below.
+            frame_windows = sliding_window_view(
+                frame[y_low - search_width:y_high + search_width,
+                      x_low - search_width:x_high + search_width].astype(
+                    result_type(reference_box_strided, frame)),
+                (y_high - y_low, x_high - x_low))[:, :, ::sampling_stride, ::sampling_stride]
+        else:
+            frame_windows = None
+
         # Start with shift [0, 0] and proceed in a circular pattern.
         for r in arange(search_width + 1):
 
-            # Create an enumerator which produces shift values [dy, dx] in a circular pattern
-            # with radius "r".
-            circle_r = Miscellaneous.circle_around(0, 0, r)
-
-            # Initialize the optimum for radius "r" to an impossibly large value,
-            # and the corresponding shifts to None.
-            deviation_min_r, dy_min_r, dx_min_r = 1.e30, None, None
+            # Get the shift values [dy, dx] in a circular pattern with radius "r" (in the order
+            # produced by method "circle_around"), and the corresponding index arrays.
+            circle_r, index_y, index_x = Miscellaneous.circle_around_indices(r, search_width)
 
             # Go through the circle with radius "r" and compute the difference (deviation)
-            # between the shifted frame and the corresponding box in the mean frame. Find the
-            # minimum "deviation_min_r" for radius "r".
-            if sampling_stride != 1:
-                for (dy, dx) in circle_r:
-                    deviation = abs(
-                        reference_box[::sampling_stride, ::sampling_stride] - frame[
-                                      y_low - dy:y_high - dy:sampling_stride,
-                                      x_low - dx:x_high - dx:sampling_stride]).sum()
-                    # deviation = sqrt(square(
-                    #     reference_box - frame[y_low - dy:y_high - dy, x_low - dx:x_high - dx]).sum())
-                    if deviation < deviation_min_r:
-                        deviation_min_r, dy_min_r, dx_min_r = deviation, dy, dx
-                    deviations[dy + search_width, dx + search_width] = deviation
+            # between the shifted frame and the corresponding box in the mean frame.
+            if frame_windows is not None:
+                differences = frame_windows[2 * search_width - index_y, 2 * search_width - index_x]
+                differences -= reference_box_strided
+                np_abs(differences, out=differences)
+                deviations_r = differences.reshape(len(circle_r), -1).sum(axis=1)
             else:
-                for (dy, dx) in circle_r:
-                    deviation = abs(
-                        reference_box - frame[y_low - dy:y_high - dy, x_low - dx:x_high - dx]).sum()
-                    if deviation < deviation_min_r:
-                        deviation_min_r, dy_min_r, dx_min_r = deviation, dy, dx
-                    deviations[dy + search_width, dx + search_width] = deviation
+                deviations_r = array([abs(reference_box_strided - frame[
+                                          y_low - dy:y_high - dy:sampling_stride,
+                                          x_low - dx:x_high - dx:sampling_stride]).sum()
+                                      for (dy, dx) in circle_r])
+            deviations[index_y, index_x] = deviations_r
+
+            # Find the minimum "deviation_min_r" for radius "r". In case of ties the first shift
+            # on the circle is taken.
+            index_min_r = argmin(deviations_r)
+            deviation_min_r = deviations_r[index_min_r]
+            dy_min_r, dx_min_r = circle_r[index_min_r]
 
             # Append the minimal deviation for radius r to list of minima.
             dev_r.append(deviation_min_r)
@@ -679,37 +706,38 @@ class Miscellaneous(object):
         :param search_width: Maximum distance in y and x from origin of the search area
         :param sampling_stride: Stride in both coordinate directions used in computing deviations
         :param dev_table: Scratch table to be used internally for storing intermediate results,
-                          size: [2*search_width, 2*search_width], dtype=float32.
+                          size: at least [2*search_width, 2*search_width], dtype=float32.
         :return: ([shift_y, shift_x], [min_r]) with:
                    shift_y, shift_x: shift values of minimum or [0, 0] if no optimum could be found.
+                                     Shifts with abs(shift) <= search_width-1 can be found.
                    [dev_r]: list of minimum deviations for all steps until a local minimum is found.
         """
 
         # Set up a table which keeps deviation values from earlier iteration steps. This way,
         # deviation evaluations can be avoided at coordinates which have been visited before.
-        # Initialize deviations with an impossibly high value.
+        # Initialize deviations with an impossibly high value. The table is indexed with
+        # [dy, dx] directly (negative shifts wrap around). With a table size of at least
+        # 2*search_width, all shifts with abs(dy), abs(dx) <= search_width-1 have unique table
+        # entries. Deviations for shifts on the search area border (abs = search_width) are not
+        # stored in the table.
         dev_table[:, :] = 1.e30
 
+        # Down-sample the reference box only once.
+        reference_box_strided = reference_box[::sampling_stride, ::sampling_stride]
+
         # Initialize the global optimum with the value at dy=dx=0.
-        if sampling_stride != 1:
-            deviation_min = abs(reference_box[::sampling_stride, ::sampling_stride] - frame[
-                                          y_low:y_high:sampling_stride,
-                                          x_low:x_high:sampling_stride]).sum()
-        else:
-            deviation_min = abs(reference_box - frame[y_low:y_high, x_low:x_high]).sum()
+        deviation_min = abs(reference_box_strided - frame[y_low:y_high:sampling_stride,
+                                                          x_low:x_high:sampling_stride]).sum()
         dev_table[0, 0] = deviation_min
         dy_min = 0
         dx_min = 0
 
-        counter_new = 0
-        counter_reused = 0
-
         # Initialize list of minimum deviations for each search radius.
         dev_r = [deviation_min]
 
-        # Start with shift [0, 0]. Stop when a circle with radius 1 around the current optimum
-        # reaches beyond the search area.
-        while max(abs(dy_min), abs(dx_min)) < search_width-1:
+        # Start with shift [0, 0]. Shifts up to search_width-1 can be found: A circle with radius
+        # 1 around the current optimum must not reach beyond the search area (radius search_width).
+        while max(abs(dy_min), abs(dx_min)) < search_width:
 
             # Create an enumerator which produces shift values [dy, dx] in a circular pattern
             # with radius 1 around the current optimum [dy_min, dx_min].
@@ -722,35 +750,21 @@ class Miscellaneous(object):
             # Go through the circle with radius 1 and compute the difference (deviation)
             # between the shifted frame and the corresponding box in the mean frame. Find the
             # minimum "deviation_min_1".
-            if sampling_stride != 1:
-                for (dy, dx) in circle_1:
+            for (dy, dx) in circle_1:
+                # Only shifts in the interior of the search area are kept in the table.
+                in_table = abs(dy) < search_width and abs(dx) < search_width
+                if in_table:
                     deviation = dev_table[dy, dx]
-                    if deviation > 1.e29:
-                        counter_new += 1
-                        deviation = abs(reference_box[::sampling_stride, ::sampling_stride] - frame[
-                                          y_low - dy:y_high - dy:sampling_stride,
-                                          x_low - dx:x_high - dx:sampling_stride]).sum()
+                else:
+                    deviation = 1.e30
+                if deviation > 1.e29:
+                    deviation = abs(reference_box_strided - frame[
+                                      y_low - dy:y_high - dy:sampling_stride,
+                                      x_low - dx:x_high - dx:sampling_stride]).sum()
+                    if in_table:
                         dev_table[dy, dx] = deviation
-                    else:
-                        counter_reused += 1
-                    if deviation < deviation_min_1:
-                        deviation_min_1, dy_min_1, dx_min_1 = deviation, dy, dx
-
-                    # deviation = abs(reference_box[::sampling_stride, ::sampling_stride] - frame[
-                    #                   y_low - dy:y_high - dy:sampling_stride,
-                    #                   x_low - dx:x_high - dx:sampling_stride]).sum()
-                    # if deviation < deviation_min_1:
-                    #     deviation_min_1, dy_min_1, dx_min_1 = deviation, dy, dx
-            else:
-                for (dy, dx) in circle_1:
-                    deviation = dev_table[dy, dx]
-                    if deviation > 1.e29:
-                        deviation = abs(
-                            reference_box - frame[y_low - dy:y_high - dy,
-                                            x_low - dx:x_high - dx]).sum()
-                        dev_table[dy, dx] = deviation
-                    if deviation < deviation_min_1:
-                        deviation_min_1, dy_min_1, dx_min_1 = deviation, dy, dx
+                if deviation < deviation_min_1:
+                    deviation_min_1, dy_min_1, dx_min_1 = deviation, dy, dx
 
             # Append the minimal deviation found in this step to list of minima.
             dev_r.append(deviation_min_1)
@@ -758,14 +772,14 @@ class Miscellaneous(object):
             # If for the current center the match is better than for all neighboring points, a
             # local optimum is found.
             if deviation_min_1 >= deviation_min:
-                # print ("new: " + str(counter_new) + ", reused: " + str(counter_reused))
                 return [dy_min, dx_min], dev_r
 
             # Otherwise, update the current optimum and continue.
             else:
                 deviation_min, dy_min, dx_min = deviation_min_1, dy_min_1, dx_min_1
 
-        # If within the maximum search radius no optimum could be found, return [0, 0].
+        # If within the maximum search radius no optimum could be found (i.e. the optimum is on
+        # the border of the search area), return [0, 0].
         return [0, 0], dev_r
 
     @staticmethod
@@ -851,9 +865,9 @@ class Miscellaneous(object):
         """
 
         # sleep(2.)
-        # Immediately return for monochrome input.
+        # Immediately return for monochrome input. Use the same return format as for color input.
         if len(input_image.shape) != 3:
-            return input_image
+            return input_image, (0., 0.), (0., 0.)
 
         # If subpixel resolution is asked for, interpolate the input image first.
         if interpolation_factor != 1:
@@ -1182,6 +1196,34 @@ class Miscellaneous(object):
             j -= 1
             yield (j, i)
 
+    # Cache for method "circle_around_indices", key: (r, search_width).
+    circle_around_indices_cache = {}
+
+    @staticmethod
+    def circle_around_indices(r, search_width):
+        """
+        Return the shift values [dy, dx] produced by "circle_around(0, 0, r)" as a list, together
+        with two index arrays which give the positions of these shifts in a (2 * search_width + 1)
+        x (2 * search_width + 1) table centered at [0, 0]. The results are cached.
+
+        :param r: Radius of the circle (1-norm, in pixels)
+        :param search_width: Maximum search radius (defines the table size)
+        :return: (circle, index_y, index_x) with:
+                 circle: List of tuples (dy, dx) in the order given by "circle_around".
+                 index_y: Array with values dy + search_width.
+                 index_x: Array with values dx + search_width.
+        """
+
+        key = (int(r), int(search_width))
+        try:
+            return Miscellaneous.circle_around_indices_cache[key]
+        except KeyError:
+            circle = list(Miscellaneous.circle_around(0, 0, r))
+            index_y = array([dy for (dy, dx) in circle], dtype=int) + search_width
+            index_x = array([dx for (dy, dx) in circle], dtype=int) + search_width
+            Miscellaneous.circle_around_indices_cache[key] = (circle, index_y, index_x)
+            return circle, index_y, index_x
+
     @staticmethod
     def write_video(name, frame_list, annotations, fps, depth=8):
         """
@@ -1191,7 +1233,9 @@ class Miscellaneous(object):
         :param frame_list: List of frames to be written
         :param annotations: List of text strings to be written into the corresponding frame
         :param fps: Frames per second of video
-        :param depth: Bit depth of the image "frame", either 8 or 16.
+        :param depth: Obsolete, kept for compatibility. The bit depth is derived from the dtype of
+                      each frame: uint16 frames are reduced to 8bit (upper byte), uint8 frames are
+                      written unchanged, other types are clipped to [0, 255].
         :return: -
         """
 
@@ -1220,16 +1264,23 @@ class Miscellaneous(object):
         # For each frame: If monochrome, convert it to three-channel color mode. insert annotation
         # and write the frame.
         for index, frame in enumerate(frame_list):
-            # If the frames are 16bit, convert them to 8bit.
-            if depth == 8:
+            # Convert the frame to 8bit, depending on its data type. 16bit frames are reduced to
+            # their upper byte (65535 -> 255).
+            if frame.dtype == uint8:
                 frame_8b = frame
+            elif frame.dtype == uint16:
+                frame_8b = (frame >> 8).astype(uint8)
             else:
-                frame_8b = (frame / 255.).astype(uint8)
+                frame_8b = frame.clip(0, 255).astype(uint8)
 
+            # Create a contiguous three-channel frame. Make sure that the annotation is not
+            # written into the caller's frame.
             if len(frame.shape) == 2:
                 rgb_frame = stack((frame_8b,) * 3, -1)
+            elif frame_8b is frame:
+                rgb_frame = frame_8b.copy()
             else:
-                rgb_frame = frame_8b
+                rgb_frame = ascontiguousarray(frame_8b)
             putText(rgb_frame, annotations[index],
                         bottomLeftCornerOfText,
                         font,
@@ -1413,42 +1464,22 @@ class Miscellaneous(object):
         :return: Sharpened image, same format as input image
         """
 
-        height, width = input_image.shape[:2]
-        color = len(input_image.shape) == 3
-
-        # Allocate workspace: Three complete images, plus 1D object with length max(row, column).
-        if color:
-            fimg = empty((3, height, width, 3), dtype=float32)
-            temp = zeros((max(width, height), 3), dtype=float32)
-        else:
-            fimg = empty((3, height, width), dtype=float32)
-            temp = zeros(max(width, height), dtype=float32)
+        # Allocate workspace: Three complete images.
+        fimg = empty((3,) + input_image.shape, dtype=float32)
 
         # Convert input image to floats.
         fimg[0] = input_image / 65535
 
         # Start with level 0. Store its Laplacian on level 1. The operator is separated in a
-        # column and a row operator.
+        # column and a row operator. Both are applied to all rows / columns at once.
         hpass = 0
         for lev in range(5):
             # Highpass and lowpass levels use image indices 1 and 2 in alternating mode to save
             # space.
             lpass = ((lev & 1) + 1)
 
-            if color:
-                for row in range(height):
-                    Miscellaneous.mexican_hat_color(temp, fimg[hpass][row, :, :], width, 1 << lev)
-                    fimg[lpass][row, :, :] = temp[:width, :] * 0.25
-                for col in range(width):
-                    Miscellaneous.mexican_hat_color(temp, fimg[lpass][:, col, :], height, 1 << lev)
-                    fimg[lpass][:, col, :] = temp[:height, :] * 0.25
-            else:
-                for row in range(height):
-                    Miscellaneous.mexican_hat(temp, fimg[hpass][row, :], width, 1 << lev)
-                    fimg[lpass][row, :] = temp[:width] * 0.25
-                for col in range(width):
-                    Miscellaneous.mexican_hat(temp, fimg[lpass][:, col], height, 1 << lev)
-                    fimg[lpass][:, col] = temp[:height] * 0.25
+            fimg[lpass] = Miscellaneous.mexican_hat_axis(fimg[hpass], 1 << lev, 1) * 0.25
+            fimg[lpass] = Miscellaneous.mexican_hat_axis(fimg[lpass], 1 << lev, 0) * 0.25
 
             # Compute the amount of the correction at the current level.
             amt = amount * exp(-(lev - radius) * (lev - radius) / 1.5) + 1.
@@ -1467,6 +1498,38 @@ class Miscellaneous(object):
         return fimg[0].astype(uint16)
 
     @staticmethod
+    def mexican_hat_axis(base, sc, axis):
+        """
+        Apply a 1D strided second derivative operator (2 * b[i] + b[i - sc] + b[i + sc]) along
+        a given axis of an image (B/W or color). At the image borders the image is mirrored
+        (without repeating the border pixel). The operation also works for images which are
+        smaller than the operator stride.
+
+        :param base: Input image, Type float32
+        :param sc: Stride (power of 2) of operator
+        :param axis: Axis along which the operator is applied (0: columns, 1: rows)
+        :return: Result image, same shape and type as "base"
+        """
+
+        size = base.shape[axis]
+
+        # Mirror the image at its borders along the given axis.
+        pad_width = [(0, 0)] * base.ndim
+        pad_width[axis] = (sc, sc)
+        if size > 1:
+            padded = pad(base, pad_width, mode='reflect')
+        else:
+            padded = pad(base, pad_width, mode='edge')
+
+        # Index ranges for the left and right neighbors of all pixels.
+        left = [slice(None)] * base.ndim
+        right = [slice(None)] * base.ndim
+        left[axis] = slice(0, size)
+        right[axis] = slice(2 * sc, 2 * sc + size)
+
+        return 2 * base + padded[tuple(left)] + padded[tuple(right)]
+
+    @staticmethod
     def mexican_hat(temp, base, size, sc):
         """
         Apply a 1D strided second derivative to a row or column of a B/W image. Store the result
@@ -1479,13 +1542,7 @@ class Miscellaneous(object):
         :return: -
         """
 
-        # Special case at begin of row/column. Full operator not applicable.
-        temp[:sc] = 2 * base[:sc] + base[sc:0:-1] + base[sc:2 * sc]
-        # Apply the full operator.
-        temp[sc:size - sc] = 2 * base[sc:size - sc] + base[:size - 2 * sc] + base[2 * sc:size]
-        # Special case at end of row/column. The full operator is not applicable.
-        temp[size - sc:size] = 2 * base[size - sc:size] + base[size - 2 * sc:size - sc] + \
-                               base[size - 2:size - 2 - sc:-1]
+        temp[:size] = Miscellaneous.mexican_hat_axis(base[:size], sc, 0)
 
     @staticmethod
     def mexican_hat_color(temp, base, size, sc):
@@ -1501,14 +1558,7 @@ class Miscellaneous(object):
         :return: -
         """
 
-        # Special case at begin of row/column. Full operator not applicable.
-        temp[:sc, :] = 2 * base[:sc, :] + base[sc:0:-1, :] + base[sc:2 * sc, :]
-        # Apply the full operator.
-        temp[sc:size - sc, :] = 2 * base[sc:size - sc, :] + base[:size - 2 * sc, :] + base[
-                                2 * sc:size, :]
-        # Special case at end of row/column. The full operator is not applicable.
-        temp[size - sc:size, :] = 2 * base[size - sc:size, :] + base[size - 2 * sc:size - sc, :] + \
-                                  base[size - 2:size - 2 - sc:-1, :]
+        temp[:size, :] = Miscellaneous.mexican_hat_axis(base[:size, :], sc, 0)
 
     @staticmethod
     def protocol(string, logfile, precede_with_timestamp=True):

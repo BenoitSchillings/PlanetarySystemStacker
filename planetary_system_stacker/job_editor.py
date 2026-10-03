@@ -125,7 +125,7 @@ class JoblistWidget(QtWidgets.QListWidget):
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls:
+        if event.mimeData().hasUrls():
             event.accept()
         else:
             event.ignore()
@@ -155,7 +155,7 @@ class JoblistWidget(QtWidgets.QListWidget):
                 # Only local files (with appropriate extensions) and directories are accepted.
                 if url.isLocalFile():
                     file_path = Path(str(url.toLocalFile()))
-                    if file_path.is_dir() or file_path.suffix in extensions:
+                    if file_path.is_dir() or file_path.suffix.lower() in extensions:
                         links.append(str(url.toLocalFile()))
             # Send the job name list to the upper-level method "get_input_names".
             self.signal_job_entries.emit(links)
